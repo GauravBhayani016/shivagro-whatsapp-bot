@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: shivagro-whatsapp-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: BOT_SECRET
+        value: shivagro-secret-2024
+      - key: NODE_VERSION
+        value: 20
