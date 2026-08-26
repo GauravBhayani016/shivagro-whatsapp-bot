@@ -25,7 +25,8 @@ import pino from 'pino';
 import QRCode from 'qrcode';
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // CORS: allow the Netlify CRM frontend to call this bot
 app.use((req, res, next) => {
