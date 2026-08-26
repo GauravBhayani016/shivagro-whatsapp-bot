@@ -204,7 +204,7 @@ app.get('/qr', async (req, res) => {
   }
 });
 
-/** Send a WhatsApp message */
+/** Send a WhatsApp message or PDF document */
 app.post('/send', async (req, res) => {
   // Validate secret token
   const clientSecret = req.headers['x-bot-secret'];
@@ -222,9 +222,12 @@ app.post('/send', async (req, res) => {
     });
   }
 
-  const { phone, message } = req.body;
-  if (!phone || !message) {
-    return res.status(400).json({ success: false, error: '"phone" and "message" are required' });
+  const { phone, message, pdfBase64, fileName, caption } = req.body;
+  if (!phone || (!message && !pdfBase64)) {
+    return res.status(400).json({
+      success: false,
+      error: '"phone" and either "message" or "pdfBase64" are required',
+    });
   }
 
   try {
@@ -233,10 +236,31 @@ app.post('/send', async (req, res) => {
     const fullPhone = digits.length === 10 ? `91${digits}` : digits;
     const chatId = `${fullPhone}@s.whatsapp.net`;
 
-    await sock.sendMessage(chatId, { text: message });
-    console.log(`[WA] ✅ Message sent to ${fullPhone}`);
+    if (pdfBase64) {
+      // Strip any data URL prefix e.g. "data:application/pdf;base64,"
+      const cleanBase64 = String(pdfBase64)
+        .replace(/^data:application\/pdf;base64,/, '')
+        .replace(/^data:.*?;base64,/, '');
+      const pdfBuffer = Buffer.from(cleanBase64, 'base64');
+      const docName = fileName || 'ShivAgro-Invoice.pdf';
+      const docCaption = caption || message || '🧾 Shiv Agro Agency - Retail Invoice';
 
-    res.json({ success: true, to: fullPhone, provider: 'baileys' });
+      await sock.sendMessage(chatId, {
+        document: pdfBuffer,
+        mimetype: 'application/pdf',
+        fileName: docName,
+        caption: docCaption,
+      });
+
+      console.log(`[WA] 📄 PDF Document sent to ${fullPhone} (${docName})`);
+      return res.json({ success: true, to: fullPhone, provider: 'baileys', type: 'pdf' });
+    }
+
+    // Otherwise send plain text message
+    await sock.sendMessage(chatId, { text: message });
+    console.log(`[WA] 💬 Text message sent to ${fullPhone}`);
+
+    res.json({ success: true, to: fullPhone, provider: 'baileys', type: 'text' });
   } catch (err) {
     console.error('[WA] ❌ Send error:', err.message);
     res.status(500).json({ success: false, error: err.message });
