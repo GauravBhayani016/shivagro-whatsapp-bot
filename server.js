@@ -232,10 +232,11 @@ app.post('/send', async (req, res) => {
   }
 
   try {
-    // Clean and format phone number for India
-    const digits = String(phone).replace(/[^0-9]/g, '');
-    const fullPhone = digits.length === 10 ? `91${digits}` : digits;
-    const chatId = `${fullPhone}@s.whatsapp.net`;
+    // Clean and format phone number for India (handles 10 digits, +91, 0 prefix, spaces, dashes)
+    let digits = String(phone).replace(/[^0-9]/g, '');
+    if (digits.startsWith('0')) digits = digits.substring(1);
+    if (digits.length === 10) digits = '91' + digits;
+    const chatId = `${digits}@s.whatsapp.net`;
 
     if (pdfBase64) {
       // Strip any data URL prefix e.g. "data:application/pdf;base64,"
