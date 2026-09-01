@@ -313,29 +313,33 @@ async function connectToWhatsApp() {
 app.get('/api/sync/all', async (req, res) => {
   db = loadDb();
 
-  // If local DB is empty, try fetching from Supabase directly
-  if (!db.products || db.products.length === 0) {
-    try {
-      const { data: supaProds } = await supabase.from('products').select('*');
-      if (supaProds && supaProds.length > 0) {
-        db.products = supaProds.map((p) => ({
-          id: p.id,
-          name: p.name,
-          brand: p.brand || '',
-          category: p.category || 'SEEDS',
-          packageSize: p.package_size,
-          batchNumber: p.batch_number || '',
-          expiryDate: p.expiry_date || '',
-          sellingPrice: Number(p.selling_price) || 0,
-          currentStock: p.current_stock || 0,
-          lowStockThreshold: p.low_stock_threshold || 10,
-          isActive: p.is_active !== false,
-          createdAt: p.created_at,
-          updatedAt: p.updated_at,
-        }));
-        saveDb(db);
-      }
-    } catch {}
+  // Always fetch fresh products & stock from Supabase for guaranteed multi-device accuracy
+  try {
+    const { data: supaProds, error: pErr } = await supabase
+      .from('products')
+      .select('*')
+      .order('name', { ascending: true });
+
+    if (!pErr && supaProds && supaProds.length > 0) {
+      db.products = supaProds.map((p) => ({
+        id: p.id,
+        name: p.name,
+        brand: p.brand || '',
+        category: p.category || 'SEEDS',
+        packageSize: p.package_size,
+        batchNumber: p.batch_number || '',
+        expiryDate: p.expiry_date || '',
+        sellingPrice: Number(p.selling_price) || 0,
+        currentStock: p.current_stock || 0,
+        lowStockThreshold: p.low_stock_threshold || 10,
+        isActive: p.is_active !== false,
+        createdAt: p.created_at,
+        updatedAt: p.updated_at,
+      }));
+      saveDb(db);
+    }
+  } catch (err) {
+    console.warn('[Sync] Supabase sync fetch notice:', err.message);
   }
 
   res.json({
@@ -361,17 +365,17 @@ app.post('/api/sync/product', async (req, res) => {
   const now = new Date().toISOString();
   let resultProduct;
 
-  if (productData.id && db.products.some((p) => p.id === productData.id)) {
-    // Update existing
-    db.products = db.products.map((p) => {
-      if (p.id === productData.id) {
-        resultProduct = { ...p, ...productData, updatedAt: now };
-        return resultProduct;
-      }
-      return p;
-    });
+  const existingLocalIdx = db.products.findIndex(
+    (p) =>
+      p.id === productData.id ||
+      (p.name.trim().toLowerCase() === productData.name.trim().toLowerCase() &&
+        p.packageSize.trim().toLowerCase() === productData.packageSize.trim().toLowerCase())
+  );
+
+  if (existingLocalIdx !== -1) {
+    resultProduct = { ...db.products[existingLocalIdx], ...productData, updatedAt: now };
+    db.products[existingLocalIdx] = resultProduct;
   } else {
-    // Create new
     resultProduct = {
       ...productData,
       id: productData.id || `prod-${Date.now()}`,
@@ -404,24 +408,52 @@ app.post('/api/sync/product', async (req, res) => {
 
   saveDb(db);
 
-  // Sync to Supabase in background
+  // Sync to Supabase without creating duplicates
   try {
-    await supabase.from('products').upsert({
-      id: resultProduct.id,
-      name: resultProduct.name,
-      brand: resultProduct.brand || '',
-      category: resultProduct.category || 'SEEDS',
-      package_size: resultProduct.packageSize,
-      batch_number: resultProduct.batchNumber || '',
-      expiry_date: resultProduct.expiryDate || '',
-      selling_price: resultProduct.sellingPrice,
-      current_stock: resultProduct.currentStock,
-      low_stock_threshold: resultProduct.lowStockThreshold || 10,
-      is_active: resultProduct.isActive !== false,
-      updated_at: now,
-    });
+    const { data: existingSupa } = await supabase
+      .from('products')
+      .select('id')
+      .ilike('name', resultProduct.name.trim())
+      .ilike('package_size', resultProduct.packageSize.trim())
+      .limit(1);
+
+    if (existingSupa && existingSupa.length > 0) {
+      await supabase
+        .from('products')
+        .update({
+          name: resultProduct.name,
+          brand: resultProduct.brand || '',
+          category: resultProduct.category || 'SEEDS',
+          package_size: resultProduct.packageSize,
+          batch_number: resultProduct.batchNumber || '',
+          expiry_date: resultProduct.expiryDate || '',
+          selling_price: resultProduct.sellingPrice,
+          current_stock: resultProduct.currentStock,
+          low_stock_threshold: resultProduct.lowStockThreshold || 10,
+          is_active: resultProduct.isActive !== false,
+          updated_at: now,
+        })
+        .eq('id', existingSupa[0].id);
+      resultProduct.id = existingSupa[0].id;
+    } else {
+      await supabase.from('products').insert({
+        id: resultProduct.id,
+        name: resultProduct.name,
+        brand: resultProduct.brand || '',
+        category: resultProduct.category || 'SEEDS',
+        package_size: resultProduct.packageSize,
+        batch_number: resultProduct.batchNumber || '',
+        expiry_date: resultProduct.expiryDate || '',
+        selling_price: resultProduct.sellingPrice,
+        current_stock: resultProduct.currentStock,
+        low_stock_threshold: resultProduct.lowStockThreshold || 10,
+        is_active: resultProduct.isActive !== false,
+        created_at: resultProduct.createdAt || now,
+        updated_at: now,
+      });
+    }
   } catch (err) {
-    console.warn('[Sync] Supabase product sync skipped:', err.message);
+    console.warn('[Sync] Supabase sync product error:', err.message);
   }
 
   res.json({ success: true, product: resultProduct });
