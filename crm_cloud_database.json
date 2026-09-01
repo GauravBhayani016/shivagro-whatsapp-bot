@@ -1,0 +1,39 @@
+{
+  "products": [],
+  "bills": [],
+  "movements": [],
+  "settings": {
+    "shopName": "Shiv Agro Agency",
+    "shopNameGujarati": "શિવ એગ્રો એજન્સી",
+    "proprietor": "Vijay C. Bhayani",
+    "proprietorGujarati": "વિજય સી. ભાયાણી",
+    "mobile1": "99098 73595",
+    "mobile2": "94295 39279",
+    "panNo": "AUTPB3720D",
+    "seedLicense": "254",
+    "pesticideLicense": "3426",
+    "fertilizerLicense": "333",
+    "address": "Vankal, Main Road, Ta. Mangrol, Dist. Surat",
+    "addressGujarati": "મુ. વાંકલ, મેઈન રોડ, તા. માંગરોળ, જિ. સુરત",
+    "jurisdiction": "Subject to Mangrol Jurisdiction",
+    "termsGujarati": "નોંધ : વાવણીમાં ભુલચુક, પ્રતિકુળ હવામાન વગેરે કારણસર બીજના ઓછા ઉગવા કે ન ઉગવાની તેમજ ફસલ અંગેની કોઈપણ ફરિયાદ, નુકશાની માટે પેઢી જવાબદાર નથી. વેચેલો માલ પરત લેવામાં કે બદલી આપવામાં આવશે નહિ. (ખેતીના ઉપયોગ માટે)"
+  },
+  "packageSizes": [
+    "100 ML",
+    "250 ML",
+    "500 ML",
+    "1 Litre",
+    "5 Litre",
+    "250 GM",
+    "500 GM",
+    "1 KG",
+    "5 KG",
+    "10 KG",
+    "25 KG",
+    "50 KG",
+    "1 Pc",
+    "1 Packet",
+    "Other"
+  ],
+  "lastUpdated": "2026-08-30T11:36:00.000Z"
+}
