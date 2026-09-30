@@ -756,7 +756,36 @@ app.get('/reconnect', async (req, res) => {
   });
 });
 
-/** QR Code HTML page */
+/** Pairing Code Route: Link via 8-digit code on phone without camera */
+app.get('/pair', async (req, res) => {
+  const rawPhone = req.query.phone || '9909873595';
+  let digits = String(rawPhone).replace(/[^0-9]/g, '');
+  if (digits.startsWith('0')) digits = digits.substring(1);
+  if (digits.length === 10) digits = '91' + digits;
+
+  if (isConnected) {
+    return res.json({ success: true, message: 'WhatsApp is already connected!' });
+  }
+
+  if (!sock) {
+    return res.status(503).json({ success: false, error: 'Socket not initialized. Please wait a few seconds and retry.' });
+  }
+
+  try {
+    const code = await sock.requestPairingCode(digits);
+    console.log(`[WA] 🔢 Pairing code generated for ${digits}: ${code}`);
+    res.json({
+      success: true,
+      phone: digits,
+      pairingCode: code,
+      instructions: 'Open WhatsApp -> Linked Devices -> Link with Phone Number -> Enter this 8-digit code',
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/** QR Code & Pairing Code HTML page */
 app.get('/qr', async (req, res) => {
   if (isConnected) {
     return res.send(`
@@ -764,73 +793,122 @@ app.get('/qr', async (req, res) => {
       <html lang="en">
       <head><meta charset="UTF-8"><title>Shiv Agro Bot Status</title></head>
       <body style="font-family:sans-serif;text-align:center;padding:60px;background:#f0fdf4">
-        <div style="max-width:400px;margin:auto;background:white;border-radius:16px;padding:40px;box-shadow:0 4px 20px #0001">
+        <div style="max-width:420px;margin:auto;background:white;border-radius:16px;padding:40px;box-shadow:0 4px 20px #0001">
           <div style="font-size:64px">✅</div>
           <h2 style="color:#16a34a;margin:16px 0 8px">WhatsApp Connected!</h2>
-          <p style="color:#555">Your bot is active, running 24/7 with Supabase session backup.</p>
-          <p style="color:#888;font-size:13px;margin-top:24px">No QR scan needed. Invoices and alerts will be sent automatically.</p>
+          <p style="color:#555">Your bot is active and ready to send invoices & alerts 24/7.</p>
         </div>
       </body>
       </html>
     `);
   }
 
-  if (!latestQR) {
-    return res.send(`
-      <!DOCTYPE html>
-      <html lang="en">
-      <head>
-        <meta charset="UTF-8">
-        <meta http-equiv="refresh" content="5">
-        <title>Shiv Agro Bot - Generating QR</title>
-      </head>
-      <body style="font-family:sans-serif;text-align:center;padding:60px;background:#fffbeb">
-        <div style="max-width:400px;margin:auto;background:white;border-radius:16px;padding:40px;box-shadow:0 4px 20px #0001">
-          <div style="font-size:64px">⏳</div>
-          <h2 style="color:#d97706">Generating WhatsApp QR...</h2>
-          <p style="color:#555">Please wait a few seconds. This page will auto-refresh.</p>
-          <p style="color:#aaa;font-size:12px">Status: ${connectionStatus}</p>
-        </div>
-      </body>
-      </html>
-    `);
+  let qrImageUrl = '';
+  if (latestQR) {
+    try {
+      qrImageUrl = await QRCode.toDataURL(latestQR, {
+        width: 260,
+        margin: 2,
+        color: { dark: '#000', light: '#fff' },
+      });
+    } catch {}
   }
 
-  try {
-    const qrImageUrl = await QRCode.toDataURL(latestQR, {
-      width: 300,
-      margin: 2,
-      color: { dark: '#000', light: '#fff' },
-    });
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Shiv Agro Bot - Connect WhatsApp</title>
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0fdf4; padding: 24px; text-align: center; color: #1f2937; }
+        .card { max-width: 440px; margin: auto; background: white; border-radius: 20px; padding: 32px 24px; box-shadow: 0 10px 25px rgba(0,0,0,0.05); }
+        h2 { color: #166534; margin: 0 0 8px; font-size: 22px; }
+        p { color: #4b5563; font-size: 13px; line-height: 1.5; margin: 0 0 16px; }
+        .tabs { display: flex; gap: 8px; margin-bottom: 20px; background: #f3f4f6; padding: 4px; border-radius: 12px; }
+        .tab-btn { flex: 1; padding: 8px; border: none; background: transparent; font-weight: bold; font-size: 13px; border-radius: 8px; cursor: pointer; color: #6b7280; }
+        .tab-btn.active { background: white; color: #166534; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .qr-img { border: 3px solid #16a34a; border-radius: 12px; width: 240px; height: 240px; }
+        .pair-box { background: #f9fafb; border: 1.5px dashed #cbd5e1; border-radius: 12px; padding: 16px; margin-top: 12px; }
+        .input-phone { width: 80%; padding: 10px 14px; font-size: 15px; border: 1.5px solid #d1d5db; border-radius: 8px; outline: none; text-align: center; font-weight: bold; margin-bottom: 10px; }
+        .btn-submit { background: #16a34a; color: white; border: none; padding: 10px 20px; font-weight: bold; border-radius: 8px; cursor: pointer; font-size: 14px; }
+        .code-display { font-size: 32px; font-weight: 900; letter-spacing: 4px; color: #15803d; background: #dcfce7; padding: 12px; border-radius: 10px; margin: 12px 0; font-family: monospace; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h2>🌿 Connect WhatsApp Bot</h2>
+        <p>Choose your preferred way to link your shop WhatsApp:</p>
 
-    res.send(`
-      <!DOCTYPE html>
-      <html lang="en">
-      <head>
-        <meta charset="UTF-8">
-        <meta http-equiv="refresh" content="30">
-        <title>Shiv Agro Bot - Scan QR</title>
-      </head>
-      <body style="font-family:sans-serif;text-align:center;padding:40px;background:#f0fdf4">
-        <div style="max-width:440px;margin:auto;background:white;border-radius:16px;padding:40px;box-shadow:0 4px 20px #0001">
-          <h2 style="color:#16a34a;margin-bottom:4px">📱 Scan QR with WhatsApp</h2>
-          <p style="color:#555;font-size:14px;margin-bottom:20px">
-            Open <strong>WhatsApp</strong> → <strong>Linked Devices</strong> → <strong>Link a Device</strong>
-          </p>
-          <img src="${qrImageUrl}"
-               alt="WhatsApp QR Code"
-               style="border:4px solid #16a34a;border-radius:12px;width:280px;height:280px" />
-          <p style="color:#888;font-size:12px;margin-top:16px">
-            ⏱ QR expires every ~60 seconds. Page auto-refreshes every 30s.<br>
-            After scanning once, credentials will be backed up to Supabase permanently.
-          </p>
+        <div class="tabs">
+          <button class="tab-btn active" onclick="switchTab('qr')">📷 QR Code Scan</button>
+          <button class="tab-btn" onclick="switchTab('code')">🔢 8-Digit Pairing Code</button>
         </div>
-      </body>
-      </html>
-    `);
-  } catch (err) {
-    res.status(500).send('Error generating QR: ' + err.message);
-  }
+
+        <div id="tab-qr" class="tab-content active">
+          ${qrImageUrl ? `
+            <img src="${qrImageUrl}" class="qr-img" alt="QR Code" />
+            <p style="font-size:12px;color:#6b7280;margin-top:12px">
+              Open <strong>WhatsApp</strong> → <strong>Linked Devices</strong> → <strong>Link a Device</strong>
+            </p>
+          ` : `
+            <div style="padding:40px 20px;background:#fffbeb;border-radius:12px;color:#b45309">
+              ⏳ Generating fresh QR Code...<br><span style="font-size:12px">Auto-refreshing in 5s...</span>
+            </div>
+            <script>setTimeout(() => location.reload(), 5000);</script>
+          `}
+        </div>
+
+        <div id="tab-code" class="tab-content">
+          <div class="pair-box">
+            <p style="font-size:12px;margin-bottom:8px">Enter WhatsApp Phone Number:</p>
+            <input type="text" id="phone-input" class="input-phone" value="99098 73595" placeholder="e.g. 9909873595" />
+            <br>
+            <button class="btn-submit" onclick="getPairingCode()">Get Pairing Code</button>
+            <div id="code-result" style="display:none;margin-top:14px">
+              <p style="font-size:12px;font-weight:bold;color:#166534">Enter this code in WhatsApp on your phone:</p>
+              <div id="code-text" class="code-display"></div>
+              <p style="font-size:11px;color:#6b7280">
+                1. Open <strong>WhatsApp</strong> → <strong>Linked Devices</strong><br>
+                2. Tap <strong>Link with phone number instead</strong><br>
+                3. Enter the 8-digit code above.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <script>
+        function switchTab(t) {
+          document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+          document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+          if (t === 'qr') {
+            document.querySelectorAll('.tab-btn')[0].classList.add('active');
+            document.getElementById('tab-qr').classList.add('active');
+          } else {
+            document.querySelectorAll('.tab-btn')[1].classList.add('active');
+            document.getElementById('tab-code').classList.add('active');
+          }
+        }
+
+        async function getPairingCode() {
+          const p = document.getElementById('phone-input').value.replace(/[^0-9]/g, '');
+          const res = await fetch('/pair?phone=' + p);
+          const data = await res.json();
+          if (data.pairingCode) {
+            document.getElementById('code-result').style.display = 'block';
+            document.getElementById('code-text').innerText = data.pairingCode;
+          } else {
+            alert(data.error || 'Could not generate pairing code. Please try again.');
+          }
+        }
+      </script>
+    </body>
+    </html>
+  `);
 });
 
 /** Send a WhatsApp message or PDF document */
