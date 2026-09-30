@@ -247,7 +247,6 @@ async function connectToWhatsApp() {
       version,
       auth: state,
       logger: pino({ level: 'silent' }),
-      printQRInTerminal: true,
       browser: ['ShivAgro Bot', 'Chrome', '124.0'],
       connectTimeoutMs: 60_000,
       defaultQueryTimeoutMs: 60_000,
