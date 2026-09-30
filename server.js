@@ -144,7 +144,7 @@ let db = loadDb();
 async function restoreAuthFromSupabase() {
   try {
     if (!fs.existsSync(AUTH_DIR)) {
-      fs.mkdirSync(AUTH_DIR, { recursive: true });
+      await fs.promises.mkdir(AUTH_DIR, { recursive: true });
     }
     if (fs.existsSync(path.join(AUTH_DIR, 'creds.json'))) {
       console.log('[WA Auth] Local creds.json found in container.');
@@ -159,17 +159,16 @@ async function restoreAuthFromSupabase() {
 
     if (!error && data && data.data && typeof data.data === 'object') {
       const files = data.data;
-      let count = 0;
-      for (const [filename, content] of Object.entries(files)) {
+      const entries = Object.entries(files);
+      const writePromises = entries.map(([filename, content]) => {
         if (filename && typeof content === 'string') {
-          fs.writeFileSync(path.join(AUTH_DIR, filename), content, 'utf8');
-          count++;
+          return fs.promises.writeFile(path.join(AUTH_DIR, filename), content, 'utf8');
         }
-      }
-      if (count > 0) {
-        console.log(`[WA Auth] ✅ Restored ${count} session files from Supabase! WhatsApp will reconnect automatically.`);
-        return true;
-      }
+        return Promise.resolve();
+      });
+      await Promise.all(writePromises);
+      console.log(`[WA Auth] ✅ Restored ${entries.length} session files asynchronously! WhatsApp will reconnect automatically.`);
+      return true;
     }
   } catch (err) {
     console.warn('[WA Auth] Supabase auth restore notice:', err.message);
@@ -183,15 +182,20 @@ function triggerAuthBackupToSupabase() {
   backupTimeout = setTimeout(async () => {
     try {
       if (!fs.existsSync(AUTH_DIR)) return;
-      const fileNames = fs.readdirSync(AUTH_DIR);
+      const fileNames = await fs.promises.readdir(AUTH_DIR);
       if (fileNames.length === 0) return;
       const bundle = {};
-      for (const file of fileNames) {
-        const fullPath = path.join(AUTH_DIR, file);
-        if (fs.statSync(fullPath).isFile()) {
-          bundle[file] = fs.readFileSync(fullPath, 'utf8');
-        }
-      }
+      await Promise.all(
+        fileNames.map(async (file) => {
+          const fullPath = path.join(AUTH_DIR, file);
+          try {
+            const stat = await fs.promises.stat(fullPath);
+            if (stat.isFile()) {
+              bundle[file] = await fs.promises.readFile(fullPath, 'utf8');
+            }
+          } catch {}
+        })
+      );
       await supabase.from('whatsapp_sessions').upsert({
         session_id: 'shivagro_bot',
         data: bundle,
@@ -201,7 +205,7 @@ function triggerAuthBackupToSupabase() {
     } catch (err) {
       console.warn('[WA Auth] Supabase backup notice:', err.message);
     }
-  }, 2000);
+  }, 5000);
 }
 
 // ─── WhatsApp Connection State ────────────────────────────────────────────────
