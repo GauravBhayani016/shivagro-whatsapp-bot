@@ -740,6 +740,18 @@ app.get('/status', (req, res) => {
   });
 });
 
+/** Force Reconnect using Supabase Session */
+app.get('/reconnect', async (req, res) => {
+  reconnectAttempts = 0;
+  connectToWhatsApp();
+  res.json({
+    success: true,
+    message: 'Reconnecting to WhatsApp using saved Supabase session...',
+    status: connectionStatus,
+    connected: isConnected,
+  });
+});
+
 /** QR Code HTML page */
 app.get('/qr', async (req, res) => {
   if (isConnected) {
