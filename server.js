@@ -150,7 +150,7 @@ async function restoreAuthFromSupabase() {
       console.log('[WA Auth] Local creds.json found in container.');
       return true;
     }
-    console.log('[WA Auth] Local creds not found, restoring session from Supabase...');
+    console.log('[WA Auth] Local creds not found, checking session in Supabase...');
     const { data, error } = await supabase
       .from('whatsapp_sessions')
       .select('data')
@@ -159,6 +159,15 @@ async function restoreAuthFromSupabase() {
 
     if (!error && data && data.data && typeof data.data === 'object') {
       const files = data.data;
+      if (files['creds.json']) {
+        try {
+          const parsedCreds = JSON.parse(files['creds.json']);
+          if (parsedCreds.registered === false) {
+            console.log('[WA Auth] ⚠️ Stale unregistered session in Supabase. Generating fresh QR code...');
+            return false;
+          }
+        } catch {}
+      }
       const entries = Object.entries(files);
       const writePromises = entries.map(([filename, content]) => {
         if (filename && typeof content === 'string') {
@@ -167,7 +176,7 @@ async function restoreAuthFromSupabase() {
         return Promise.resolve();
       });
       await Promise.all(writePromises);
-      console.log(`[WA Auth] ✅ Restored ${entries.length} session files asynchronously! WhatsApp will reconnect automatically.`);
+      console.log(`[WA Auth] ✅ Restored ${entries.length} valid session files!`);
       return true;
     }
   } catch (err) {
@@ -292,7 +301,12 @@ async function connectToWhatsApp() {
 
         if (isLoggedOut) {
           connectionStatus = 'logged_out';
-          console.log('[WA] ⚠️ Logged out from WhatsApp. Please visit /qr and re-scan.');
+          console.log('[WA] ⚠️ Logged out from WhatsApp. Wiping stale auth dir to generate new QR...');
+          try {
+            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+          } catch {}
+          reconnectAttempts = 0;
+          reconnectTimer = setTimeout(connectToWhatsApp, 1500);
         } else {
           connectionStatus = 'disconnected';
           reconnectAttempts++;
