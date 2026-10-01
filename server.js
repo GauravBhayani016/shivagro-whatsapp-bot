@@ -6,6 +6,7 @@
  *   1. Sending WhatsApp messages & PDF invoices
  *   2. Real-time Cloud Sync between Mobile 1, Mobile 2 (Papa's phone), and Netlify PC Web CRM
  *   3. Supabase Cloud Session Persistence (never loses WhatsApp connection on Render restarts)
+ *   4. Instant QR Code scanning & 8-Digit Phone Pairing Code Linking
  */
 
 import express from 'express';
@@ -13,6 +14,8 @@ import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  Browsers,
+  makeCacheableSignalKeyStore,
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import QRCode from 'qrcode';
@@ -169,6 +172,8 @@ async function restoreAuthFromSupabase() {
         } catch {}
       }
       const entries = Object.entries(files);
+      if (entries.length === 0) return false;
+
       const writePromises = entries.map(([filename, content]) => {
         if (filename && typeof content === 'string') {
           return fs.promises.writeFile(path.join(AUTH_DIR, filename), content, 'utf8');
@@ -214,13 +219,15 @@ function triggerAuthBackupToSupabase() {
     } catch (err) {
       console.warn('[WA Auth] Supabase backup notice:', err.message);
     }
-  }, 5000);
+  }, 3000);
 }
 
 // ─── WhatsApp Connection State ────────────────────────────────────────────────
 let sock = null;
 let latestQR = null;
+let latestQrDataUrl = null;
 let isConnected = false;
+let connectedUserPhone = '';
 let connectionStatus = 'connecting';
 let reconnectAttempts = 0;
 let reconnectTimer = null;
@@ -256,11 +263,17 @@ async function connectToWhatsApp() {
       sock = null;
     }
 
+    const logger = pino({ level: 'silent' });
+
     sock = makeWASocket({
       version,
-      auth: state,
-      logger: pino({ level: 'silent' }),
-      browser: ['ShivAgro Bot', 'Chrome', '124.0'],
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      logger,
+      // Browsers.ubuntu('Chrome') ensures WhatsApp backend accepts Pairing Codes & QR handshakes
+      browser: Browsers.ubuntu('Chrome'),
       connectTimeoutMs: 60_000,
       defaultQueryTimeoutMs: 60_000,
       keepAliveIntervalMs: 25_000,
@@ -274,26 +287,42 @@ async function connectToWhatsApp() {
       triggerAuthBackupToSupabase();
     });
 
-    sock.ev.on('connection.update', (update) => {
+    sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
         latestQR = qr;
         connectionStatus = 'qr_ready';
-        console.log('[WA] 📱 QR Code ready! Visit /qr to scan it.');
+        try {
+          latestQrDataUrl = await QRCode.toDataURL(qr, {
+            width: 280,
+            margin: 2,
+            color: { dark: '#0f172a', light: '#ffffff' },
+          });
+        } catch {}
+        console.log('[WA] 📱 Fresh QR Code generated! Ready to scan or pair with 8-digit code.');
       }
 
       if (connection === 'open') {
         isConnected = true;
         latestQR = null;
+        latestQrDataUrl = null;
         connectionStatus = 'connected';
         reconnectAttempts = 0;
-        console.log('[WA] ✅ WhatsApp connected and ready to send messages 24/7!');
+        
+        try {
+          const rawId = sock?.user?.id || '';
+          connectedUserPhone = rawId.split(':')[0].split('@')[0];
+        } catch {}
+
+        console.log(`[WA] ✅ WhatsApp connected successfully! Active number: ${connectedUserPhone || 'Shop WhatsApp'}`);
         triggerAuthBackupToSupabase();
       }
 
       if (connection === 'close') {
         isConnected = false;
+        latestQR = null;
+        latestQrDataUrl = null;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401;
 
@@ -303,7 +332,10 @@ async function connectToWhatsApp() {
           connectionStatus = 'logged_out';
           console.log('[WA] ⚠️ Logged out from WhatsApp. Wiping stale auth dir to generate new QR...');
           try {
-            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+            if (fs.existsSync(AUTH_DIR)) {
+              fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+            }
+            await supabase.from('whatsapp_sessions').delete().eq('session_id', 'shivagro_bot');
           } catch {}
           reconnectAttempts = 0;
           reconnectTimer = setTimeout(connectToWhatsApp, 1500);
@@ -322,6 +354,48 @@ async function connectToWhatsApp() {
     reconnectAttempts++;
     reconnectTimer = setTimeout(connectToWhatsApp, 5000);
   }
+}
+
+/** Reset Session completely */
+async function resetWhatsAppSession() {
+  console.log('[WA] 🧹 Resetting WhatsApp session (wiping local files and Supabase record)...');
+  isConnected = false;
+  latestQR = null;
+  latestQrDataUrl = null;
+  connectedUserPhone = '';
+  connectionStatus = 'connecting';
+
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  if (sock) {
+    try {
+      sock.ev.removeAllListeners('creds.update');
+      sock.ev.removeAllListeners('connection.update');
+      sock.end(undefined);
+    } catch {}
+    sock = null;
+  }
+
+  try {
+    if (fs.existsSync(AUTH_DIR)) {
+      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    }
+  } catch (e) {
+    console.warn('[WA] Could not remove local auth dir:', e.message);
+  }
+
+  try {
+    await supabase.from('whatsapp_sessions').delete().eq('session_id', 'shivagro_bot');
+    console.log('[WA] ☁️ Deleted Supabase whatsapp_sessions record.');
+  } catch (e) {
+    console.warn('[WA] Supabase delete session notice:', e.message);
+  }
+
+  reconnectAttempts = 0;
+  await connectToWhatsApp();
 }
 
 // ─── Real-Time Cloud Sync Endpoints (Multi-Device Sync) ────────────────────────
@@ -716,13 +790,14 @@ app.post('/api/sync/reset-database', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     service: 'Shiv Agro WhatsApp Bot & Cloud Sync Hub',
-    version: '2.7.0',
+    version: '3.0.0',
     status: connectionStatus,
     connected: isConnected,
+    userPhone: connectedUserPhone,
     totalProducts: db.products?.length || 0,
     totalBills: db.bills?.length || 0,
     uptimeSeconds: Math.floor((Date.now() - startTime.getTime()) / 1000),
-    hint: isConnected ? 'WhatsApp ready & Cloud Sync Active!' : 'Visit /qr to scan QR code',
+    hint: isConnected ? `WhatsApp ready (${connectedUserPhone}) & Cloud Sync Active!` : 'Visit /qr to scan QR code or get 8-digit pairing code',
   });
 });
 
@@ -733,6 +808,7 @@ app.get('/ping', (req, res) => {
     timestamp: new Date().toISOString(),
     status: connectionStatus,
     connected: isConnected,
+    userPhone: connectedUserPhone,
   });
 });
 
@@ -742,6 +818,7 @@ app.get('/health', (req, res) => {
     ok: true,
     connected: isConnected,
     status: connectionStatus,
+    userPhone: connectedUserPhone,
     uptime: Math.floor((Date.now() - startTime.getTime()) / 1000),
   });
 });
@@ -751,9 +828,22 @@ app.get('/status', (req, res) => {
   res.json({
     connected: isConnected,
     status: connectionStatus,
+    userPhone: connectedUserPhone,
     qrAvailable: !!latestQR,
     totalProducts: db.products?.length || 0,
     totalBills: db.bills?.length || 0,
+    uptimeSeconds: Math.floor((Date.now() - startTime.getTime()) / 1000),
+  });
+});
+
+/** Live Poll Endpoint for QR Web UI */
+app.get('/api/qr-status', async (req, res) => {
+  res.json({
+    connected: isConnected,
+    status: connectionStatus,
+    userPhone: connectedUserPhone,
+    hasQr: !!latestQR,
+    qrDataUrl: latestQrDataUrl,
     uptimeSeconds: Math.floor((Date.now() - startTime.getTime()) / 1000),
   });
 });
@@ -770,155 +860,617 @@ app.get('/reconnect', async (req, res) => {
   });
 });
 
-/** Pairing Code Route: Link via 8-digit code on phone without camera */
-app.get('/pair', async (req, res) => {
-  const rawPhone = req.query.phone || '9909873595';
-  let digits = String(rawPhone).replace(/[^0-9]/g, '');
-  if (digits.startsWith('0')) digits = digits.substring(1);
-  if (digits.length === 10) digits = '91' + digits;
-
-  if (isConnected) {
-    return res.json({ success: true, message: 'WhatsApp is already connected!' });
-  }
-
-  if (!sock) {
-    return res.status(503).json({ success: false, error: 'Socket not initialized. Please wait a few seconds and retry.' });
-  }
-
+/** Reset Session Endpoint (Wipes local & cloud session files for clean fresh QR/Pairing) */
+app.all(['/reset-session', '/api/reset-session'], async (req, res) => {
   try {
-    const code = await sock.requestPairingCode(digits);
-    console.log(`[WA] 🔢 Pairing code generated for ${digits}: ${code}`);
+    await resetWhatsAppSession();
     res.json({
       success: true,
-      phone: digits,
-      pairingCode: code,
-      instructions: 'Open WhatsApp -> Linked Devices -> Link with Phone Number -> Enter this 8-digit code',
+      message: 'WhatsApp session wiped cleanly. Initializing fresh QR Code & Pairing Code...',
+      status: connectionStatus,
+      connected: isConnected,
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-/** QR Code & Pairing Code HTML page */
-app.get('/qr', async (req, res) => {
+/** Pairing Code Route: Link via 8-digit code on phone without camera */
+app.all('/pair', async (req, res) => {
+  const rawPhone = req.query.phone || req.body?.phone || '9909873595';
+  let digits = String(rawPhone).replace(/[^0-9]/g, '');
+  if (digits.startsWith('0')) digits = digits.substring(1);
+  if (digits.length === 10) digits = '91' + digits;
+
   if (isConnected) {
-    return res.send(`
-      <!DOCTYPE html>
-      <html lang="en">
-      <head><meta charset="UTF-8"><title>Shiv Agro Bot Status</title></head>
-      <body style="font-family:sans-serif;text-align:center;padding:60px;background:#f0fdf4">
-        <div style="max-width:420px;margin:auto;background:white;border-radius:16px;padding:40px;box-shadow:0 4px 20px #0001">
-          <div style="font-size:64px">✅</div>
-          <h2 style="color:#16a34a;margin:16px 0 8px">WhatsApp Connected!</h2>
-          <p style="color:#555">Your bot is active and ready to send invoices & alerts 24/7.</p>
-        </div>
-      </body>
-      </html>
-    `);
+    return res.json({
+      success: true,
+      connected: true,
+      userPhone: connectedUserPhone,
+      message: 'WhatsApp is already connected!',
+    });
   }
 
-  let qrImageUrl = '';
-  if (latestQR) {
-    try {
-      qrImageUrl = await QRCode.toDataURL(latestQR, {
-        width: 260,
-        margin: 2,
-        color: { dark: '#000', light: '#fff' },
+  if (!sock) {
+    return res.status(503).json({
+      success: false,
+      error: 'WhatsApp socket is starting up. Please wait 3 seconds and retry.',
+    });
+  }
+
+  try {
+    const code = await sock.requestPairingCode(digits);
+    const formattedCode = code ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+    console.log(`[WA] 🔢 Pairing code generated for ${digits}: ${formattedCode} (Raw: ${code})`);
+    res.json({
+      success: true,
+      phone: digits,
+      pairingCode: formattedCode,
+      rawCode: code,
+      instructions: 'Open WhatsApp -> Linked Devices -> Link a Device -> Link with phone number instead -> Enter 8-digit code',
+    });
+  } catch (err) {
+    console.error(`[WA] ❌ Pairing code generation failed for ${digits}:`, err.message);
+    if (err.message?.includes('registered') || err.message?.includes('closed') || err.message?.includes('401')) {
+      return res.status(400).json({
+        success: false,
+        error: `Could not generate code: ${err.message}. Please click "Reset Session" and retry.`,
+        needsReset: true,
       });
-    } catch {}
+    }
+    res.status(500).json({ success: false, error: err.message });
   }
+});
 
+/** Interactive, Real-Time QR Code & 8-Digit Pairing Code HTML Page */
+app.get('/qr', async (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html lang="en">
     <head>
       <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>Shiv Agro Bot - Connect WhatsApp</title>
+      <link rel="preconnect" href="https://fonts.googleapis.com">
+      <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+      <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800;900&display=swap" rel="stylesheet">
       <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0fdf4; padding: 24px; text-align: center; color: #1f2937; }
-        .card { max-width: 440px; margin: auto; background: white; border-radius: 20px; padding: 32px 24px; box-shadow: 0 10px 25px rgba(0,0,0,0.05); }
-        h2 { color: #166534; margin: 0 0 8px; font-size: 22px; }
-        p { color: #4b5563; font-size: 13px; line-height: 1.5; margin: 0 0 16px; }
-        .tabs { display: flex; gap: 8px; margin-bottom: 20px; background: #f3f4f6; padding: 4px; border-radius: 12px; }
-        .tab-btn { flex: 1; padding: 8px; border: none; background: transparent; font-weight: bold; font-size: 13px; border-radius: 8px; cursor: pointer; color: #6b7280; }
-        .tab-btn.active { background: white; color: #166534; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-        .tab-content { display: none; }
-        .tab-content.active { display: block; }
-        .qr-img { border: 3px solid #16a34a; border-radius: 12px; width: 240px; height: 240px; }
-        .pair-box { background: #f9fafb; border: 1.5px dashed #cbd5e1; border-radius: 12px; padding: 16px; margin-top: 12px; }
-        .input-phone { width: 80%; padding: 10px 14px; font-size: 15px; border: 1.5px solid #d1d5db; border-radius: 8px; outline: none; text-align: center; font-weight: bold; margin-bottom: 10px; }
-        .btn-submit { background: #16a34a; color: white; border: none; padding: 10px 20px; font-weight: bold; border-radius: 8px; cursor: pointer; font-size: 14px; }
-        .code-display { font-size: 32px; font-weight: 900; letter-spacing: 4px; color: #15803d; background: #dcfce7; padding: 12px; border-radius: 10px; margin: 12px 0; font-family: monospace; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+          font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+          background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 50%, #f8fafc 100%);
+          min-height: 100vh;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 20px 12px;
+          color: #0f172a;
+        }
+        .container {
+          width: 100%;
+          max-width: 480px;
+          background: #ffffff;
+          border-radius: 24px;
+          box-shadow: 0 20px 40px -15px rgba(22, 101, 52, 0.12), 0 0 0 1px rgba(22, 101, 52, 0.08);
+          overflow: hidden;
+        }
+        .header {
+          background: linear-gradient(135deg, #15803d 0%, #166534 100%);
+          padding: 28px 24px 20px;
+          text-align: center;
+          color: #ffffff;
+        }
+        .brand-badge {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          background: rgba(255, 255, 255, 0.2);
+          backdrop-filter: blur(8px);
+          padding: 4px 12px;
+          border-radius: 20px;
+          font-size: 11px;
+          font-weight: 800;
+          letter-spacing: 0.5px;
+          text-transform: uppercase;
+          margin-bottom: 8px;
+        }
+        .header h1 { font-size: 22px; font-weight: 900; margin-bottom: 4px; }
+        .header p { font-size: 12px; opacity: 0.9; font-weight: 600; }
+        
+        .body { padding: 24px; }
+
+        /* Tabs */
+        .tabs {
+          display: flex;
+          background: #f1f5f9;
+          padding: 4px;
+          border-radius: 14px;
+          gap: 4px;
+          margin-bottom: 20px;
+        }
+        .tab-btn {
+          flex: 1;
+          padding: 10px 12px;
+          border: none;
+          background: transparent;
+          font-family: inherit;
+          font-size: 12px;
+          font-weight: 800;
+          color: #64748b;
+          border-radius: 10px;
+          cursor: pointer;
+          transition: all 0.2s ease;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 6px;
+        }
+        .tab-btn.active {
+          background: #ffffff;
+          color: #166534;
+          box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        }
+
+        .view-section { display: none; }
+        .view-section.active { display: block; }
+
+        /* QR View */
+        .qr-wrapper {
+          text-align: center;
+          padding: 10px 0;
+        }
+        .qr-box {
+          display: inline-block;
+          padding: 14px;
+          background: #ffffff;
+          border-radius: 20px;
+          border: 2px solid #bbf7d0;
+          box-shadow: 0 10px 25px -5px rgba(22, 163, 74, 0.15);
+          position: relative;
+        }
+        .qr-img {
+          width: 240px;
+          height: 240px;
+          display: block;
+          border-radius: 10px;
+        }
+        .qr-spinner {
+          width: 240px;
+          height: 240px;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          gap: 12px;
+          background: #f8fafc;
+          border-radius: 10px;
+          color: #64748b;
+          font-size: 13px;
+          font-weight: 700;
+        }
+        .spin {
+          width: 32px;
+          height: 32px;
+          border: 3px solid #cbd5e1;
+          border-top-color: #16a34a;
+          border-radius: 50%;
+          animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .scan-steps {
+          margin-top: 18px;
+          background: #f8fafc;
+          border: 1px solid #e2e8f0;
+          border-radius: 14px;
+          padding: 14px 16px;
+          text-align: left;
+        }
+        .scan-steps p { font-size: 12px; font-weight: 800; color: #1e293b; margin-bottom: 8px; }
+        .scan-steps ol { margin-left: 18px; font-size: 12px; color: #475569; line-height: 1.6; }
+
+        /* Pairing Code View */
+        .pair-container {
+          text-align: center;
+        }
+        .input-group {
+          margin-bottom: 14px;
+          text-align: left;
+        }
+        .input-group label {
+          display: block;
+          font-size: 11px;
+          font-weight: 800;
+          color: #475569;
+          text-transform: uppercase;
+          margin-bottom: 6px;
+        }
+        .phone-input {
+          width: 100%;
+          padding: 12px 14px;
+          font-size: 16px;
+          font-weight: 800;
+          font-family: inherit;
+          border: 1.5px solid #cbd5e1;
+          border-radius: 12px;
+          outline: none;
+          color: #0f172a;
+          background: #f8fafc;
+          transition: all 0.2s;
+        }
+        .phone-input:focus {
+          border-color: #16a34a;
+          background: #ffffff;
+          box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.15);
+        }
+        .btn-primary {
+          width: 100%;
+          padding: 14px;
+          background: #16a34a;
+          color: #ffffff;
+          border: none;
+          border-radius: 12px;
+          font-size: 14px;
+          font-weight: 800;
+          font-family: inherit;
+          cursor: pointer;
+          transition: all 0.2s;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+        }
+        .btn-primary:hover { background: #15803d; }
+        .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+
+        .code-card {
+          margin-top: 18px;
+          padding: 16px;
+          background: #f0fdf4;
+          border: 2px dashed #86efac;
+          border-radius: 16px;
+          text-align: center;
+        }
+        .code-display {
+          font-family: monospace;
+          font-size: 32px;
+          font-weight: 900;
+          letter-spacing: 4px;
+          color: #15803d;
+          background: #ffffff;
+          padding: 12px 16px;
+          border-radius: 12px;
+          border: 1px solid #bbf7d0;
+          margin: 10px 0;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 12px;
+        }
+        .btn-copy {
+          background: #16a34a;
+          color: #ffffff;
+          border: none;
+          border-radius: 8px;
+          padding: 6px 10px;
+          font-size: 11px;
+          font-weight: 800;
+          cursor: pointer;
+        }
+
+        /* Connected View */
+        .connected-card {
+          text-align: center;
+          padding: 24px 16px;
+        }
+        .success-icon {
+          width: 64px;
+          height: 64px;
+          background: #dcfce7;
+          border: 3px solid #86efac;
+          border-radius: 50%;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 32px;
+          margin-bottom: 14px;
+        }
+        .connected-card h2 { color: #166534; font-size: 20px; font-weight: 900; margin-bottom: 6px; }
+        .connected-card p { font-size: 13px; color: #475569; font-weight: 600; }
+        .phone-badge {
+          display: inline-block;
+          margin-top: 10px;
+          background: #166534;
+          color: #ffffff;
+          padding: 6px 14px;
+          border-radius: 20px;
+          font-size: 13px;
+          font-weight: 800;
+          letter-spacing: 0.5px;
+        }
+
+        /* Test message tool */
+        .test-box {
+          margin-top: 20px;
+          background: #f8fafc;
+          border: 1px solid #e2e8f0;
+          border-radius: 14px;
+          padding: 14px;
+          text-align: left;
+        }
+        .test-box p { font-size: 12px; font-weight: 800; color: #1e293b; margin-bottom: 8px; }
+
+        /* Footer & Reset */
+        .footer {
+          margin-top: 20px;
+          padding-top: 16px;
+          border-top: 1px solid #e2e8f0;
+          text-align: center;
+        }
+        .btn-reset {
+          background: transparent;
+          border: 1px solid #cbd5e1;
+          color: #64748b;
+          padding: 8px 14px;
+          border-radius: 10px;
+          font-size: 11px;
+          font-weight: 800;
+          cursor: pointer;
+          transition: all 0.2s;
+        }
+        .btn-reset:hover {
+          background: #fee2e2;
+          color: #991b1b;
+          border-color: #fca5a5;
+        }
+        .pulse-dot {
+          display: inline-block;
+          width: 8px;
+          height: 8px;
+          background: #16a34a;
+          border-radius: 50%;
+          margin-right: 4px;
+          animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+          0% { transform: scale(0.95); opacity: 0.8; }
+          50% { transform: scale(1.3); opacity: 1; }
+          100% { transform: scale(0.95); opacity: 0.8; }
+        }
       </style>
     </head>
     <body>
-      <div class="card">
-        <h2>🌿 Connect WhatsApp Bot</h2>
-        <p>Choose your preferred way to link your shop WhatsApp:</p>
-
-        <div class="tabs">
-          <button class="tab-btn active" onclick="switchTab('qr')">📷 QR Code Scan</button>
-          <button class="tab-btn" onclick="switchTab('code')">🔢 8-Digit Pairing Code</button>
+      <div class="container">
+        <div class="header">
+          <div class="brand-badge">🌿 Shiv Agro Agency Bot</div>
+          <h1>WhatsApp Connection Hub</h1>
+          <p>Link your phone once to send instant bills & stock alerts 24/7</p>
         </div>
 
-        <div id="tab-qr" class="tab-content active">
-          ${qrImageUrl ? `
-            <img src="${qrImageUrl}" class="qr-img" alt="QR Code" />
-            <p style="font-size:12px;color:#6b7280;margin-top:12px">
-              Open <strong>WhatsApp</strong> → <strong>Linked Devices</strong> → <strong>Link a Device</strong>
-            </p>
-          ` : `
-            <div style="padding:40px 20px;background:#fffbeb;border-radius:12px;color:#b45309">
-              ⏳ Generating fresh QR Code...<br><span style="font-size:12px">Auto-refreshing in 5s...</span>
-            </div>
-            <script>setTimeout(() => location.reload(), 5000);</script>
-          `}
-        </div>
+        <div class="body">
+          <!-- Main Connected State View -->
+          <div id="view-connected" class="view-section">
+            <div class="connected-card">
+              <div class="success-icon">✅</div>
+              <h2>WhatsApp Connected!</h2>
+              <p>Your bot is live, authenticated, and ready to send invoices.</p>
+              <div id="conn-phone" class="phone-badge">Active Connection</div>
 
-        <div id="tab-code" class="tab-content">
-          <div class="pair-box">
-            <p style="font-size:12px;margin-bottom:8px">Enter WhatsApp Phone Number:</p>
-            <input type="text" id="phone-input" class="input-phone" value="99098 73595" placeholder="e.g. 9909873595" />
-            <br>
-            <button class="btn-submit" onclick="getPairingCode()">Get Pairing Code</button>
-            <div id="code-result" style="display:none;margin-top:14px">
-              <p style="font-size:12px;font-weight:bold;color:#166534">Enter this code in WhatsApp on your phone:</p>
-              <div id="code-text" class="code-display"></div>
-              <p style="font-size:11px;color:#6b7280">
-                1. Open <strong>WhatsApp</strong> → <strong>Linked Devices</strong><br>
-                2. Tap <strong>Link with phone number instead</strong><br>
-                3. Enter the 8-digit code above.
-              </p>
+              <div class="test-box">
+                <p>⚡ Send Test WhatsApp Message</p>
+                <input type="text" id="test-phone" class="phone-input" placeholder="Enter recipient phone (e.g. 9909873595)" value="9909873595" style="margin-bottom:8px;font-size:13px;padding:9px;" />
+                <button class="btn-primary" onclick="sendTestMessage()" id="btn-test-send">
+                  <span>Send Test Message 💬</span>
+                </button>
+                <div id="test-status" style="font-size:11px;font-weight:700;margin-top:6px;display:none;"></div>
+              </div>
             </div>
+          </div>
+
+          <!-- Connecting / Pairing Tabs View -->
+          <div id="view-linking" class="view-section active">
+            <div class="tabs">
+              <button class="tab-btn active" onclick="setTab('qr')">
+                <span>📷 Scan QR Code</span>
+              </button>
+              <button class="tab-btn" onclick="setTab('pair')">
+                <span>🔢 8-Digit Pairing Code</span>
+              </button>
+            </div>
+
+            <!-- Tab 1: QR Code -->
+            <div id="tab-qr" class="tab-pane">
+              <div class="qr-wrapper">
+                <div class="qr-box">
+                  <div id="qr-loading" class="qr-spinner">
+                    <div class="spin"></div>
+                    <span>Generating fresh QR code...</span>
+                  </div>
+                  <img id="qr-image" class="qr-img" src="" alt="WhatsApp QR Code" style="display:none;" />
+                </div>
+                <div style="font-size:11px;color:#166534;font-weight:800;margin-top:10px;">
+                  <span class="pulse-dot"></span> Live auto-refreshing every 20s
+                </div>
+              </div>
+
+              <div class="scan-steps">
+                <p>📋 Quick Steps to Scan:</p>
+                <ol>
+                  <li>Open <strong>WhatsApp</strong> on your phone</li>
+                  <li>Tap <strong>Settings (or ⋮)</strong> → <strong>Linked Devices</strong></li>
+                  <li>Tap <strong>Link a Device</strong> & scan the QR above</li>
+                </ol>
+              </div>
+            </div>
+
+            <!-- Tab 2: 8-Digit Code -->
+            <div id="tab-pair" class="tab-pane" style="display:none;">
+              <div class="pair-container">
+                <div class="input-group">
+                  <label>WhatsApp Phone Number</label>
+                  <input type="text" id="phone-input" class="phone-input" value="99098 73595" placeholder="e.g. 9909873595" />
+                </div>
+
+                <button class="btn-primary" id="btn-pair" onclick="getPairingCode()">
+                  <span>Get 8-Digit Code</span>
+                </button>
+
+                <div id="code-result" class="code-card" style="display:none;">
+                  <p style="font-size:12px;font-weight:800;color:#166534;">Enter this code on your WhatsApp:</p>
+                  <div class="code-display">
+                    <span id="code-text">----</span>
+                    <button class="btn-copy" onclick="copyCode()">Copy</button>
+                  </div>
+                  <div style="font-size:11px;color:#64748b;line-height:1.5;text-align:left;margin-top:8px;">
+                    1. Open <strong>WhatsApp</strong> → <strong>Linked Devices</strong><br>
+                    2. Tap <strong>Link a Device</strong><br>
+                    3. Tap <strong>"Link with phone number instead"</strong> at bottom<br>
+                    4. Type the 8-digit code above!
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="footer">
+            <button class="btn-reset" onclick="resetSession()">
+              🔄 Reset Session & Generate Fresh QR
+            </button>
           </div>
         </div>
       </div>
 
       <script>
-        function switchTab(t) {
-          document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-          document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-          if (t === 'qr') {
-            document.querySelectorAll('.tab-btn')[0].classList.add('active');
-            document.getElementById('tab-qr').classList.add('active');
-          } else {
-            document.querySelectorAll('.tab-btn')[1].classList.add('active');
-            document.getElementById('tab-code').classList.add('active');
+        let currentTab = 'qr';
+        let pollTimer = null;
+        let lastRawCode = '';
+
+        function setTab(tab) {
+          currentTab = tab;
+          document.querySelectorAll('.tab-btn').forEach((b, idx) => {
+            if ((tab === 'qr' && idx === 0) || (tab === 'pair' && idx === 1)) {
+              b.classList.add('active');
+            } else {
+              b.classList.remove('active');
+            }
+          });
+          document.getElementById('tab-qr').style.display = tab === 'qr' ? 'block' : 'none';
+          document.getElementById('tab-pair').style.display = tab === 'pair' ? 'block' : 'none';
+        }
+
+        async function pollStatus() {
+          try {
+            const res = await fetch('/api/qr-status');
+            const data = await res.json();
+
+            if (data.connected) {
+              document.getElementById('view-linking').classList.remove('active');
+              document.getElementById('view-connected').classList.add('active');
+              document.getElementById('conn-phone').innerText = 'Phone: ' + (data.userPhone ? '+' + data.userPhone : 'Shop WhatsApp');
+              return;
+            }
+
+            document.getElementById('view-linking').classList.add('active');
+            document.getElementById('view-connected').classList.remove('active');
+
+            if (data.qrDataUrl) {
+              const img = document.getElementById('qr-image');
+              const load = document.getElementById('qr-loading');
+              if (img.src !== data.qrDataUrl) {
+                img.src = data.qrDataUrl;
+              }
+              img.style.display = 'block';
+              load.style.display = 'none';
+            }
+          } catch (e) {
+            console.warn('Poll error:', e);
           }
         }
 
         async function getPairingCode() {
-          const p = document.getElementById('phone-input').value.replace(/[^0-9]/g, '');
-          const res = await fetch('/pair?phone=' + p);
-          const data = await res.json();
-          if (data.pairingCode) {
-            document.getElementById('code-result').style.display = 'block';
-            document.getElementById('code-text').innerText = data.pairingCode;
-          } else {
-            alert(data.error || 'Could not generate pairing code. Please try again.');
+          const raw = document.getElementById('phone-input').value;
+          const digits = raw.replace(/[^0-9]/g, '');
+          const btn = document.getElementById('btn-pair');
+          btn.disabled = true;
+          btn.innerHTML = '<span>Generating code...</span>';
+
+          try {
+            const res = await fetch('/pair?phone=' + digits);
+            const data = await res.json();
+
+            if (data.success && data.pairingCode) {
+              document.getElementById('code-result').style.display = 'block';
+              document.getElementById('code-text').innerText = data.pairingCode;
+              lastRawCode = data.rawCode || data.pairingCode.replace(/[^a-zA-Z0-9]/g, '');
+            } else {
+              alert(data.error || 'Failed to generate pairing code. Please click "Reset Session" and try again.');
+            }
+          } catch (err) {
+            alert('Error contacting server: ' + err.message);
+          } finally {
+            btn.disabled = false;
+            btn.innerHTML = '<span>Get 8-Digit Code</span>';
           }
         }
+
+        function copyCode() {
+          const text = lastRawCode || document.getElementById('code-text').innerText.replace(/-/g, '');
+          navigator.clipboard.writeText(text).then(() => alert('Code copied to clipboard!'));
+        }
+
+        async function resetSession() {
+          if (!confirm('This will wipe any old or corrupted WhatsApp session data and generate a brand new QR & pairing code. Proceed?')) return;
+          const load = document.getElementById('qr-loading');
+          const img = document.getElementById('qr-image');
+          img.style.display = 'none';
+          load.style.display = 'flex';
+          load.innerHTML = '<div class="spin"></div><span>Resetting session...</span>';
+          document.getElementById('code-result').style.display = 'none';
+
+          try {
+            await fetch('/reset-session');
+            setTimeout(pollStatus, 2000);
+          } catch (err) {
+            alert('Reset error: ' + err.message);
+          }
+        }
+
+        async function sendTestMessage() {
+          const phone = document.getElementById('test-phone').value;
+          const statusDiv = document.getElementById('test-status');
+          const btn = document.getElementById('btn-test-send');
+          btn.disabled = true;
+          statusDiv.style.display = 'block';
+          statusDiv.style.color = '#15803d';
+          statusDiv.innerText = 'Sending test WhatsApp message...';
+
+          try {
+            const res = await fetch('/send', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'x-bot-secret': 'shivagro-secret-2024' },
+              body: JSON.stringify({
+                phone: phone,
+                message: '🌿 *Shiv Agro Agency - Test Alert*\n\nYour WhatsApp Bot is connected and operational 24/7!\nInvoices and inventory notifications are active.',
+              }),
+            });
+            const data = await res.json();
+            if (data.success) {
+              statusDiv.innerText = '✅ Test message sent successfully!';
+            } else {
+              statusDiv.style.color = '#b91c1c';
+              statusDiv.innerText = '❌ Failed: ' + (data.error || 'Unknown error');
+            }
+          } catch (e) {
+            statusDiv.style.color = '#b91c1c';
+            statusDiv.innerText = '❌ Error: ' + e.message;
+          } finally {
+            btn.disabled = false;
+          }
+        }
+
+        // Start real-time polling every 2.5 seconds
+        pollStatus();
+        pollTimer = setInterval(pollStatus, 2500);
       </script>
     </body>
     </html>
@@ -936,7 +1488,7 @@ app.post('/send', async (req, res) => {
   if (!isConnected || !sock) {
     return res.status(503).json({
       success: false,
-      error: 'WhatsApp not connected. Visit /qr to scan QR code.',
+      error: 'WhatsApp not connected. Visit /qr to scan QR code or enter 8-digit pairing code.',
       status: connectionStatus,
     });
   }
@@ -990,7 +1542,7 @@ setInterval(() => {
     process.env.RENDER_EXTERNAL_URL ||
     process.env.SERVER_URL ||
     process.env.BOT_PUBLIC_URL ||
-    `https://shivagro-whatsapp-bot.onrender.com`;
+    `https://shivagro-whatsapp-bot-ecz2.onrender.com`;
 
   fetch(`${pingUrl.replace(/\/$/, '')}/ping`)
     .then((r) => r.json())
@@ -1000,7 +1552,7 @@ setInterval(() => {
 app.listen(PORT, '0.0.0.0', async () => {
   console.log(`\n🚀 Shiv Agro WhatsApp Bot & Cloud Sync Hub running on port ${PORT}`);
   console.log(`   Health: http://localhost:${PORT}/`);
-  console.log(`   QR Scan: http://localhost:${PORT}/qr`);
+  console.log(`   QR Scan & Pair: http://localhost:${PORT}/qr`);
   console.log(`   Cloud Sync API: http://localhost:${PORT}/api/sync/all`);
   console.log(`   Ping: http://localhost:${PORT}/ping\n`);
   await connectToWhatsApp();
