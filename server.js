@@ -151,16 +151,8 @@ async function restoreAuthFromSupabase() {
     if (!fs.existsSync(AUTH_DIR)) {
       await fs.promises.mkdir(AUTH_DIR, { recursive: true });
     }
-    if (fs.existsSync(path.join(AUTH_DIR, 'creds.json'))) {
-      try {
-        const localCreds = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, 'creds.json'), 'utf8'));
-        if (localCreds && localCreds.registered !== false) {
-          console.log('[WA Auth] Local creds.json found with active registration.');
-          return true;
-        }
-      } catch {}
-    }
-    console.log('[WA Auth] Checking session in Supabase...');
+
+    console.log('[WA Auth] Checking saved session in Supabase Cloud...');
     const { data, error } = await supabase
       .from('whatsapp_sessions')
       .select('data')
@@ -169,38 +161,50 @@ async function restoreAuthFromSupabase() {
 
     if (!error && data && data.data && typeof data.data === 'object') {
       const files = data.data;
-      if (files['creds.json']) {
-        try {
-          const parsedCreds = JSON.parse(files['creds.json']);
-          if (parsedCreds.registered === false) {
-            console.log('[WA Auth] ⚠️ Stale unregistered session in Supabase. Starting clean...');
-            return false;
-          }
-        } catch {}
-      }
       const entries = Object.entries(files);
-      if (entries.length === 0) return false;
-
-      const writePromises = entries.map(([filename, content]) => {
-        if (filename && typeof content === 'string') {
-          return fs.promises.writeFile(path.join(AUTH_DIR, filename), content, 'utf8');
-        }
-        return Promise.resolve();
-      });
-      await Promise.all(writePromises);
-      console.log(`[WA Auth] ✅ Restored ${entries.length} valid session files!`);
-      return true;
+      if (entries.length > 0) {
+        const writePromises = entries.map(([filename, content]) => {
+          if (filename && typeof content === 'string') {
+            if (filename === 'creds.json') {
+              try {
+                const parsed = JSON.parse(content);
+                if (parsed.me || parsed.registered !== false) {
+                  parsed.registered = true;
+                }
+                return fs.promises.writeFile(path.join(AUTH_DIR, filename), JSON.stringify(parsed, null, 2), 'utf8');
+              } catch {}
+            }
+            return fs.promises.writeFile(path.join(AUTH_DIR, filename), content, 'utf8');
+          }
+          return Promise.resolve();
+        });
+        await Promise.all(writePromises);
+        console.log(`[WA Auth] ✅ Successfully restored ${entries.length} persistent session files from Supabase!`);
+        return true;
+      }
     }
   } catch (err) {
     console.warn('[WA Auth] Supabase auth restore notice:', err.message);
   }
+
+  if (fs.existsSync(path.join(AUTH_DIR, 'creds.json'))) {
+    try {
+      const localCreds = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, 'creds.json'), 'utf8'));
+      if (localCreds && (localCreds.me || localCreds.registered !== false)) {
+        console.log('[WA Auth] Local creds.json found with active registration.');
+        return true;
+      }
+    } catch {}
+  }
+
   return false;
 }
 
 let backupTimeout = null;
-function triggerAuthBackupToSupabase() {
+function triggerAuthBackupToSupabase(immediate = false) {
   if (backupTimeout) clearTimeout(backupTimeout);
-  backupTimeout = setTimeout(async () => {
+
+  const doBackup = async () => {
     try {
       if (!fs.existsSync(AUTH_DIR)) return;
       const fileNames = await fs.promises.readdir(AUTH_DIR);
@@ -212,7 +216,17 @@ function triggerAuthBackupToSupabase() {
           try {
             const stat = await fs.promises.stat(fullPath);
             if (stat.isFile()) {
-              bundle[file] = await fs.promises.readFile(fullPath, 'utf8');
+              if (file === 'creds.json') {
+                try {
+                  const creds = JSON.parse(await fs.promises.readFile(fullPath, 'utf8'));
+                  if (creds.me || creds.registered !== false) creds.registered = true;
+                  bundle[file] = JSON.stringify(creds, null, 2);
+                } catch {
+                  bundle[file] = await fs.promises.readFile(fullPath, 'utf8');
+                }
+              } else {
+                bundle[file] = await fs.promises.readFile(fullPath, 'utf8');
+              }
             }
           } catch {}
         })
@@ -222,11 +236,17 @@ function triggerAuthBackupToSupabase() {
         data: bundle,
         updated_at: new Date().toISOString(),
       });
-      console.log(`[WA Auth] ☁️ WhatsApp session successfully backed up to Supabase Cloud.`);
+      console.log(`[WA Auth] ☁️ WhatsApp session backed up to Supabase Cloud (${Object.keys(bundle).length} files).`);
     } catch (err) {
       console.warn('[WA Auth] Supabase backup notice:', err.message);
     }
-  }, 3000);
+  };
+
+  if (immediate) {
+    doBackup();
+  } else {
+    backupTimeout = setTimeout(doBackup, 2000);
+  }
 }
 
 // ─── WhatsApp Connection State ────────────────────────────────────────────────
@@ -316,9 +336,7 @@ async function connectToWhatsApp(options = {}) {
 
     sock.ev.on('creds.update', async () => {
       await saveCreds();
-      if (sock?.authState?.creds?.registered) {
-        triggerAuthBackupToSupabase();
-      }
+      triggerAuthBackupToSupabase(false);
     });
 
     sock.ev.on('connection.update', async (update) => {
@@ -351,7 +369,7 @@ async function connectToWhatsApp(options = {}) {
         } catch {}
 
         console.log(`[WA] ✅ WhatsApp connected successfully! Active number: ${connectedUserPhone || 'Shop WhatsApp'}`);
-        triggerAuthBackupToSupabase();
+        triggerAuthBackupToSupabase(true);
       }
 
       if (connection === 'close') {
@@ -363,9 +381,9 @@ async function connectToWhatsApp(options = {}) {
 
         console.log(`[WA] ⚠️ Connection closed. Code: ${statusCode} (Reason: ${lastDisconnect?.error?.message || 'Unknown'})`);
 
-        if (isLoggedOut || reconnectAttempts >= 3) {
-          connectionStatus = isLoggedOut ? 'logged_out' : 'disconnected';
-          console.log(`[WA] ⚠️ ${isLoggedOut ? 'Logged out' : 'Persistent disconnect after multiple attempts'}. Wiping stale auth to generate fresh QR/Pairing...`);
+        if (isLoggedOut) {
+          connectionStatus = 'logged_out';
+          console.log(`[WA] ⚠️ WhatsApp explicitly logged out from phone. Cleaning session...`);
           try {
             if (fs.existsSync(AUTH_DIR)) {
               fs.rmSync(AUTH_DIR, { recursive: true, force: true });
@@ -377,8 +395,8 @@ async function connectToWhatsApp(options = {}) {
         } else {
           connectionStatus = 'disconnected';
           reconnectAttempts++;
-          const delay = Math.min(3000 * Math.pow(1.3, Math.min(reconnectAttempts, 8)), 25000);
-          console.log(`[WA] 🔄 Reconnecting in ${(delay / 1000).toFixed(1)}s...`);
+          const delay = Math.min(3000 * Math.pow(1.2, Math.min(reconnectAttempts, 8)), 20000);
+          console.log(`[WA] 🔄 Retrying connection using saved Supabase session in ${(delay / 1000).toFixed(1)}s (Attempt ${reconnectAttempts})...`);
           reconnectTimer = setTimeout(() => connectToWhatsApp(), delay);
         }
       }
