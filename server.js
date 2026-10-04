@@ -111,6 +111,7 @@ function loadDb() {
         products: Array.isArray(parsed.products) ? parsed.products : [],
         bills: Array.isArray(parsed.bills) ? parsed.bills : [],
         movements: Array.isArray(parsed.movements) ? parsed.movements : [],
+        recycleBin: Array.isArray(parsed.recycleBin) ? parsed.recycleBin : [],
         settings: parsed.settings || INITIAL_SHOP_SETTINGS,
         packageSizes: parsed.packageSizes || DEFAULT_PACKAGE_SIZES,
         lastUpdated: parsed.lastUpdated || new Date().toISOString(),
@@ -124,6 +125,7 @@ function loadDb() {
     products: [],
     bills: [],
     movements: [],
+    recycleBin: [],
     settings: INITIAL_SHOP_SETTINGS,
     packageSizes: DEFAULT_PACKAGE_SIZES,
     lastUpdated: new Date().toISOString(),
@@ -463,17 +465,69 @@ app.get('/api/sync/all', async (req, res) => {
         createdAt: p.created_at,
         updatedAt: p.updated_at,
       }));
-      saveDb(db);
     }
   } catch (err) {
-    console.warn('[Sync] Supabase sync fetch notice:', err.message);
+    console.warn('[Sync] Supabase sync products fetch notice:', err.message);
   }
+
+  // Also fetch fresh bills from Supabase and merge
+  try {
+    const { data: supaBills, error: bErr } = await supabase
+      .from('bills')
+      .select('*, bill_items (*)')
+      .order('created_at', { ascending: false });
+
+    if (!bErr && supaBills && supaBills.length > 0) {
+      const parsedSupaBills = supaBills.map((b) => ({
+        id: b.id,
+        billNumber: b.bill_number,
+        customerName: b.customer_name,
+        customerPhone: b.customer_phone || undefined,
+        customerAddress: b.customer_address || undefined,
+        subtotal: Number(b.subtotal),
+        total: Number(b.total),
+        paymentMethod: b.payment_method || 'CASH',
+        paymentStatus: b.payment_status || 'PAID',
+        dueDate: b.due_date || undefined,
+        paidAt: b.paid_at || undefined,
+        status: b.status || 'FINAL',
+        createdBy: b.created_by || 'Vijaybhai Bhayani',
+        createdAt: b.created_at,
+        items: (b.bill_items || []).map((bi, idx) => ({
+          id: bi.id || `bi-${b.id}-${idx}`,
+          productId: bi.product_id || null,
+          itemType: bi.item_type || 'INVENTORY',
+          itemName: bi.item_name,
+          manufacturer: bi.manufacturer || '',
+          packageSize: bi.package_size || '',
+          batchNumber: bi.batch_number || '—',
+          expiryDate: bi.expiry_date || '—',
+          quantity: Number(bi.quantity),
+          rate: Number(bi.rate),
+          amount: Number(bi.amount || bi.quantity * bi.rate),
+        })),
+      }));
+
+      // Merge Supabase bills with local db.bills without duplicates
+      const billMap = new Map();
+      (db.bills || []).forEach((b) => billMap.set(b.id || b.billNumber, b));
+      parsedSupaBills.forEach((b) => billMap.set(b.id || b.billNumber, b));
+      db.bills = Array.from(billMap.values()).sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+    }
+  } catch (err) {
+    console.warn('[Sync] Supabase sync bills fetch notice:', err.message);
+  }
+
+  saveDb(db);
 
   res.json({
     success: true,
     products: db.products || [],
     bills: db.bills || [],
     movements: db.movements || [],
+    recycleBin: db.recycleBin || [],
     settings: db.settings || INITIAL_SHOP_SETTINGS,
     packageSizes: db.packageSizes || DEFAULT_PACKAGE_SIZES,
     lastUpdated: db.lastUpdated,
@@ -586,12 +640,28 @@ app.post('/api/sync/product', async (req, res) => {
   res.json({ success: true, product: resultProduct });
 });
 
-/** Delete Product */
+/** Delete Product (Soft Delete -> Moved to Recycle Bin) */
 app.post('/api/sync/delete-product', async (req, res) => {
   const { id } = req.body;
   if (!id) return res.status(400).json({ success: false, error: 'Product ID required' });
 
   db = loadDb();
+  const product = db.products.find((p) => p.id === id);
+
+  if (product) {
+    if (!Array.isArray(db.recycleBin)) db.recycleBin = [];
+    db.recycleBin.unshift({
+      id: `trash-prod-${Date.now()}`,
+      itemType: 'PRODUCT',
+      originalId: product.id,
+      title: `${product.name} (${product.packageSize})`,
+      subtitle: `Brand: ${product.brand || 'N/A'} · Stock: ${product.currentStock}`,
+      data: product,
+      deletedAt: new Date().toISOString(),
+      deletedBy: 'Vijaybhai Bhayani',
+    });
+  }
+
   db.products = db.products.filter((p) => p.id !== id);
   db.movements = db.movements.filter((m) => m.productId !== id);
   saveDb(db);
@@ -601,7 +671,7 @@ app.post('/api/sync/delete-product', async (req, res) => {
     await supabase.from('products').delete().eq('id', id);
   } catch {}
 
-  res.json({ success: true, deletedId: id });
+  res.json({ success: true, deletedId: id, movedToRecycleBin: true });
 });
 
 /** Stock Adjustment */
@@ -742,48 +812,110 @@ app.post('/api/sync/bill', async (req, res) => {
   }
 
   db.movements.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-  db.bills.unshift(newBill);
+  
+  // Save locally
+  const existingIdx = (db.bills || []).findIndex((b) => b.id === newBill.id || b.billNumber === newBill.billNumber);
+  if (existingIdx !== -1) {
+    db.bills[existingIdx] = newBill;
+  } else {
+    db.bills.unshift(newBill);
+  }
   saveDb(db);
+
+  // Sync to Supabase in background
+  try {
+    const { data: supaBill } = await supabase.from('bills').upsert({
+      id: newBill.id,
+      bill_number: newBill.billNumber,
+      customer_name: newBill.customerName,
+      customer_phone: newBill.customerPhone || null,
+      customer_address: newBill.customerAddress || null,
+      subtotal: newBill.subtotal,
+      total: newBill.total,
+      payment_method: newBill.paymentMethod,
+      payment_status: newBill.paymentStatus,
+      due_date: newBill.dueDate || null,
+      status: newBill.status,
+      created_by: newBill.createdBy,
+      created_at: newBill.createdAt,
+    }).select('id').single();
+
+    if (supaBill && newBill.items) {
+      const dbItems = newBill.items.map((it) => ({
+        id: it.id,
+        bill_id: newBill.id,
+        product_id: it.productId || null,
+        item_type: it.itemType || 'INVENTORY',
+        item_name: it.itemName,
+        manufacturer: it.manufacturer || '',
+        package_size: it.packageSize || '',
+        batch_number: it.batchNumber || null,
+        expiry_date: it.expiryDate || null,
+        quantity: it.quantity,
+        rate: it.rate,
+        amount: it.amount,
+      }));
+      await supabase.from('bill_items').upsert(dbItems);
+    }
+  } catch (err) {
+    console.warn('[Sync] Supabase saveBill notice:', err.message);
+  }
 
   res.json({ success: true, bill: newBill });
 });
 
-/** Delete Bill & Restore Stock */
-app.post('/api/sync/delete-bill', (req, res) => {
+/** Delete Bill (Soft Delete -> Moved to Recycle Bin) */
+app.post('/api/sync/delete-bill', async (req, res) => {
   const { id, restoreStock } = req.body;
   if (!id) return res.status(400).json({ success: false, error: 'Bill ID required' });
 
   db = loadDb();
   const bill = db.bills.find((b) => b.id === id);
 
-  if (bill && restoreStock !== false) {
-    const now = new Date().toISOString();
-    for (const it of bill.items || []) {
-      if (it.itemType === 'INVENTORY' && it.productId) {
-        const prodIdx = db.products.findIndex((p) => p.id === it.productId);
-        if (prodIdx !== -1) {
-          const prod = db.products[prodIdx];
-          const prev = prod.currentStock;
-          const next = prev + it.quantity;
-          prod.currentStock = next;
-          prod.updatedAt = now;
-          db.products[prodIdx] = prod;
+  if (bill) {
+    // Add to Recycle Bin
+    if (!Array.isArray(db.recycleBin)) db.recycleBin = [];
+    db.recycleBin.unshift({
+      id: `trash-bill-${Date.now()}`,
+      itemType: 'BILL',
+      originalId: bill.id,
+      title: `Bill #${bill.billNumber} - ${bill.customerName}`,
+      subtitle: `Total: ₹${bill.total.toLocaleString('en-IN')} · ${bill.items?.length || 0} items`,
+      data: bill,
+      deletedAt: new Date().toISOString(),
+      deletedBy: 'Vijaybhai Bhayani',
+      restoreStock: restoreStock !== false,
+    });
 
-          db.movements.unshift({
-            id: `mov-${Date.now()}-${it.productId}`,
-            productId: prod.id,
-            productName: prod.name,
-            packageSize: prod.packageSize,
-            movementType: 'CORRECTION',
-            quantity: it.quantity,
-            previousStock: prev,
-            newStock: next,
-            referenceType: 'BILL',
-            referenceId: bill.billNumber,
-            note: `Restored stock from deleted Bill #${bill.billNumber}`,
-            createdBy: 'Vijaybhai Bhayani',
-            createdAt: now,
-          });
+    if (restoreStock !== false) {
+      const now = new Date().toISOString();
+      for (const it of bill.items || []) {
+        if (it.itemType === 'INVENTORY' && it.productId) {
+          const prodIdx = db.products.findIndex((p) => p.id === it.productId);
+          if (prodIdx !== -1) {
+            const prod = db.products[prodIdx];
+            const prev = prod.currentStock;
+            const next = prev + it.quantity;
+            prod.currentStock = next;
+            prod.updatedAt = now;
+            db.products[prodIdx] = prod;
+
+            db.movements.unshift({
+              id: `mov-${Date.now()}-${it.productId}`,
+              productId: prod.id,
+              productName: prod.name,
+              packageSize: prod.packageSize,
+              movementType: 'CORRECTION',
+              quantity: it.quantity,
+              previousStock: prev,
+              newStock: next,
+              referenceType: 'BILL',
+              referenceId: bill.billNumber,
+              note: `Restored stock from deleted Bill #${bill.billNumber}`,
+              createdBy: 'Vijaybhai Bhayani',
+              createdAt: now,
+            });
+          }
         }
       }
     }
@@ -793,7 +925,106 @@ app.post('/api/sync/delete-bill', (req, res) => {
   db.movements.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   saveDb(db);
 
-  res.json({ success: true, deletedId: id });
+  try {
+    await supabase.from('bill_items').delete().eq('bill_id', id);
+    await supabase.from('bills').delete().eq('id', id);
+  } catch {}
+
+  res.json({ success: true, deletedId: id, movedToRecycleBin: true });
+});
+
+// ─── Recycle Bin Endpoints ───────────────────────────────────────────────────
+
+/** Add Item to Recycle Bin */
+app.post('/api/sync/recycle-bin/add', (req, res) => {
+  const item = req.body;
+  if (!item || !item.id) return res.status(400).json({ success: false, error: 'Item required' });
+  db = loadDb();
+  if (!Array.isArray(db.recycleBin)) db.recycleBin = [];
+  db.recycleBin = db.recycleBin.filter((it) => it.id !== item.id);
+  db.recycleBin.unshift(item);
+  saveDb(db);
+  res.json({ success: true, count: db.recycleBin.length });
+});
+
+/** Restore Item from Recycle Bin */
+app.post('/api/sync/recycle-bin/restore', async (req, res) => {
+  const { trashId } = req.body;
+  if (!trashId) return res.status(400).json({ success: false, error: 'trashId required' });
+  db = loadDb();
+  if (!Array.isArray(db.recycleBin)) db.recycleBin = [];
+  const target = db.recycleBin.find((it) => it.id === trashId);
+  if (!target) return res.status(404).json({ success: false, error: 'Item not found in Recycle Bin' });
+
+  if (target.itemType === 'BILL') {
+    const bill = target.data;
+    const exists = (db.bills || []).some((b) => b.id === bill.id || b.billNumber === bill.billNumber);
+    if (!exists) {
+      db.bills.unshift(bill);
+    }
+    try {
+      await supabase.from('bills').upsert({
+        id: bill.id,
+        bill_number: bill.billNumber,
+        customer_name: bill.customerName,
+        customer_phone: bill.customerPhone || null,
+        customer_address: bill.customerAddress || null,
+        subtotal: bill.subtotal,
+        total: bill.total,
+        payment_method: bill.paymentMethod || 'CASH',
+        payment_status: bill.paymentStatus || 'PAID',
+        due_date: bill.dueDate || null,
+        status: bill.status || 'FINAL',
+        created_by: bill.createdBy || 'Vijaybhai Bhayani',
+        created_at: bill.createdAt,
+      });
+      if (bill.items) {
+        const dbItems = bill.items.map((it) => ({
+          id: it.id,
+          bill_id: bill.id,
+          product_id: it.productId || null,
+          item_type: it.itemType || 'INVENTORY',
+          item_name: it.itemName,
+          manufacturer: it.manufacturer || '',
+          package_size: it.packageSize || '',
+          batch_number: it.batchNumber || null,
+          expiry_date: it.expiryDate || null,
+          quantity: it.quantity,
+          rate: it.rate,
+          amount: it.amount,
+        }));
+        await supabase.from('bill_items').upsert(dbItems);
+      }
+    } catch {}
+  } else if (target.itemType === 'PRODUCT') {
+    const prod = target.data;
+    const exists = (db.products || []).some((p) => p.id === prod.id);
+    if (!exists) {
+      db.products.unshift(prod);
+    }
+  }
+
+  db.recycleBin = db.recycleBin.filter((it) => it.id !== trashId);
+  saveDb(db);
+  res.json({ success: true, restoredItem: target });
+});
+
+/** Permanently Delete from Recycle Bin */
+app.post('/api/sync/recycle-bin/delete-permanent', (req, res) => {
+  const { trashId } = req.body;
+  db = loadDb();
+  if (!Array.isArray(db.recycleBin)) db.recycleBin = [];
+  db.recycleBin = db.recycleBin.filter((it) => it.id !== trashId);
+  saveDb(db);
+  res.json({ success: true, remaining: db.recycleBin.length });
+});
+
+/** Empty Recycle Bin */
+app.post('/api/sync/recycle-bin/empty', (req, res) => {
+  db = loadDb();
+  db.recycleBin = [];
+  saveDb(db);
+  res.json({ success: true, message: 'Recycle Bin emptied successfully' });
 });
 
 /** Save Settings */
