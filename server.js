@@ -207,6 +207,18 @@ function triggerAuthBackupToSupabase(immediate = false) {
   const doBackup = async () => {
     try {
       if (!fs.existsSync(AUTH_DIR)) return;
+      const credsPath = path.join(AUTH_DIR, 'creds.json');
+      if (!fs.existsSync(credsPath)) return;
+      let creds = null;
+      try {
+        creds = JSON.parse(await fs.promises.readFile(credsPath, 'utf8'));
+      } catch {}
+
+      // CRITICAL: Only backup to Supabase if the session is actively paired and authenticated
+      if (!creds || !creds.me) {
+        return;
+      }
+
       const fileNames = await fs.promises.readdir(AUTH_DIR);
       if (fileNames.length === 0) return;
       const bundle = {};
@@ -217,13 +229,8 @@ function triggerAuthBackupToSupabase(immediate = false) {
             const stat = await fs.promises.stat(fullPath);
             if (stat.isFile()) {
               if (file === 'creds.json') {
-                try {
-                  const creds = JSON.parse(await fs.promises.readFile(fullPath, 'utf8'));
-                  if (creds.me || creds.registered !== false) creds.registered = true;
-                  bundle[file] = JSON.stringify(creds, null, 2);
-                } catch {
-                  bundle[file] = await fs.promises.readFile(fullPath, 'utf8');
-                }
+                creds.registered = true;
+                bundle[file] = JSON.stringify(creds, null, 2);
               } else {
                 bundle[file] = await fs.promises.readFile(fullPath, 'utf8');
               }
@@ -236,7 +243,7 @@ function triggerAuthBackupToSupabase(immediate = false) {
         data: bundle,
         updated_at: new Date().toISOString(),
       });
-      console.log(`[WA Auth] ☁️ WhatsApp session backed up to Supabase Cloud (${Object.keys(bundle).length} files).`);
+      console.log(`[WA Auth] ☁️ WhatsApp session permanently saved to Supabase Cloud (${Object.keys(bundle).length} files for ${creds.me.name || creds.me.id}).`);
     } catch (err) {
       console.warn('[WA Auth] Supabase backup notice:', err.message);
     }
