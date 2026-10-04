@@ -150,10 +150,15 @@ async function restoreAuthFromSupabase() {
       await fs.promises.mkdir(AUTH_DIR, { recursive: true });
     }
     if (fs.existsSync(path.join(AUTH_DIR, 'creds.json'))) {
-      console.log('[WA Auth] Local creds.json found in container.');
-      return true;
+      try {
+        const localCreds = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, 'creds.json'), 'utf8'));
+        if (localCreds && localCreds.registered !== false) {
+          console.log('[WA Auth] Local creds.json found with active registration.');
+          return true;
+        }
+      } catch {}
     }
-    console.log('[WA Auth] Local creds not found, checking session in Supabase...');
+    console.log('[WA Auth] Checking session in Supabase...');
     const { data, error } = await supabase
       .from('whatsapp_sessions')
       .select('data')
@@ -166,7 +171,7 @@ async function restoreAuthFromSupabase() {
         try {
           const parsedCreds = JSON.parse(files['creds.json']);
           if (parsedCreds.registered === false) {
-            console.log('[WA Auth] ⚠️ Stale unregistered session in Supabase. Generating fresh QR code...');
+            console.log('[WA Auth] ⚠️ Stale unregistered session in Supabase. Starting clean...');
             return false;
           }
         } catch {}
@@ -226,24 +231,49 @@ function triggerAuthBackupToSupabase() {
 let sock = null;
 let latestQR = null;
 let latestQrDataUrl = null;
+let latestQrTimestamp = 0;
 let isConnected = false;
 let connectedUserPhone = '';
 let connectionStatus = 'connecting';
 let reconnectAttempts = 0;
 let reconnectTimer = null;
+let isInitializing = false;
 const startTime = new Date();
 
-async function connectToWhatsApp() {
+async function connectToWhatsApp(options = {}) {
+  const { forceClean = false } = options;
+
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
 
-  console.log(`[WA] Initializing WhatsApp connection... (Attempt ${reconnectAttempts + 1})`);
+  if (isInitializing) {
+    console.log('[WA] Initialization already in progress, skipping duplicate call.');
+    return;
+  }
+  isInitializing = true;
+
+  console.log(`[WA] Initializing WhatsApp connection... (Attempt ${reconnectAttempts + 1}${forceClean ? ', forceClean: true' : ''})`);
   connectionStatus = 'connecting';
 
   try {
-    await restoreAuthFromSupabase();
+    if (forceClean) {
+      try {
+        if (fs.existsSync(AUTH_DIR)) {
+          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+        }
+        await supabase.from('whatsapp_sessions').delete().eq('session_id', 'shivagro_bot');
+      } catch (e) {
+        console.warn('[WA] forceClean wipe error:', e.message);
+      }
+    } else {
+      await restoreAuthFromSupabase();
+    }
+
+    if (!fs.existsSync(AUTH_DIR)) {
+      await fs.promises.mkdir(AUTH_DIR, { recursive: true });
+    }
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version, isLatest } = await fetchLatestBaileysVersion().catch(() => ({
@@ -284,7 +314,9 @@ async function connectToWhatsApp() {
 
     sock.ev.on('creds.update', async () => {
       await saveCreds();
-      triggerAuthBackupToSupabase();
+      if (sock?.authState?.creds?.registered) {
+        triggerAuthBackupToSupabase();
+      }
     });
 
     sock.ev.on('connection.update', async (update) => {
@@ -292,6 +324,7 @@ async function connectToWhatsApp() {
 
       if (qr) {
         latestQR = qr;
+        latestQrTimestamp = Date.now();
         connectionStatus = 'qr_ready';
         try {
           latestQrDataUrl = await QRCode.toDataURL(qr, {
@@ -328,9 +361,9 @@ async function connectToWhatsApp() {
 
         console.log(`[WA] ⚠️ Connection closed. Code: ${statusCode} (Reason: ${lastDisconnect?.error?.message || 'Unknown'})`);
 
-        if (isLoggedOut) {
-          connectionStatus = 'logged_out';
-          console.log('[WA] ⚠️ Logged out from WhatsApp. Wiping stale auth dir to generate new QR...');
+        if (isLoggedOut || reconnectAttempts >= 3) {
+          connectionStatus = isLoggedOut ? 'logged_out' : 'disconnected';
+          console.log(`[WA] ⚠️ ${isLoggedOut ? 'Logged out' : 'Persistent disconnect after multiple attempts'}. Wiping stale auth to generate fresh QR/Pairing...`);
           try {
             if (fs.existsSync(AUTH_DIR)) {
               fs.rmSync(AUTH_DIR, { recursive: true, force: true });
@@ -338,13 +371,13 @@ async function connectToWhatsApp() {
             await supabase.from('whatsapp_sessions').delete().eq('session_id', 'shivagro_bot');
           } catch {}
           reconnectAttempts = 0;
-          reconnectTimer = setTimeout(connectToWhatsApp, 1500);
+          reconnectTimer = setTimeout(() => connectToWhatsApp({ forceClean: true }), 1500);
         } else {
           connectionStatus = 'disconnected';
           reconnectAttempts++;
-          const delay = Math.min(3000 * Math.pow(1.3, Math.min(reconnectAttempts, 8)), 30000);
+          const delay = Math.min(3000 * Math.pow(1.3, Math.min(reconnectAttempts, 8)), 25000);
           console.log(`[WA] 🔄 Reconnecting in ${(delay / 1000).toFixed(1)}s...`);
-          reconnectTimer = setTimeout(connectToWhatsApp, delay);
+          reconnectTimer = setTimeout(() => connectToWhatsApp(), delay);
         }
       }
     });
@@ -352,7 +385,9 @@ async function connectToWhatsApp() {
     console.error('[WA] Initialization failed:', initErr.message);
     connectionStatus = 'disconnected';
     reconnectAttempts++;
-    reconnectTimer = setTimeout(connectToWhatsApp, 5000);
+    reconnectTimer = setTimeout(() => connectToWhatsApp(), 5000);
+  } finally {
+    isInitializing = false;
   }
 }
 
@@ -362,6 +397,7 @@ async function resetWhatsAppSession() {
   isConnected = false;
   latestQR = null;
   latestQrDataUrl = null;
+  latestQrTimestamp = 0;
   connectedUserPhone = '';
   connectionStatus = 'connecting';
 
@@ -395,7 +431,7 @@ async function resetWhatsAppSession() {
   }
 
   reconnectAttempts = 0;
-  await connectToWhatsApp();
+  await connectToWhatsApp({ forceClean: true });
 }
 
 // ─── Real-Time Cloud Sync Endpoints (Multi-Device Sync) ────────────────────────
@@ -838,6 +874,12 @@ app.get('/status', (req, res) => {
 
 /** Live Poll Endpoint for QR Web UI */
 app.get('/api/qr-status', async (req, res) => {
+  // If not connected and no QR (or QR expired > 40s ago), actively trigger fresh QR generation
+  if (!isConnected && (!latestQR || Date.now() - latestQrTimestamp > 40000) && !isInitializing) {
+    console.log('[WA] /api/qr-status requested fresh QR regeneration...');
+    connectToWhatsApp();
+  }
+
   res.json({
     connected: isConnected,
     status: connectionStatus,
@@ -876,11 +918,18 @@ app.all(['/reset-session', '/api/reset-session'], async (req, res) => {
 });
 
 /** Pairing Code Route: Link via 8-digit code on phone without camera */
-app.all('/pair', async (req, res) => {
+app.all(['/pair', '/api/pair', '/api/request-pairing-code'], async (req, res) => {
   const rawPhone = req.query.phone || req.body?.phone || '9909873595';
   let digits = String(rawPhone).replace(/[^0-9]/g, '');
   if (digits.startsWith('0')) digits = digits.substring(1);
   if (digits.length === 10) digits = '91' + digits;
+
+  if (digits.length < 10) {
+    return res.status(400).json({
+      success: false,
+      error: 'Please enter a valid 10-digit mobile number.',
+    });
+  }
 
   if (isConnected) {
     return res.json({
@@ -891,18 +940,27 @@ app.all('/pair', async (req, res) => {
     });
   }
 
-  if (!sock) {
-    return res.status(503).json({
-      success: false,
-      error: 'WhatsApp socket is starting up. Please wait 3 seconds and retry.',
-    });
-  }
-
   try {
+    // If socket is not ready or registered with old credentials, reset clean
+    if (!sock || sock?.authState?.creds?.registered) {
+      console.log('[WA] Resetting session to ensure unregistered socket for pairing code...');
+      await resetWhatsAppSession();
+      // Wait for socket to start
+      for (let i = 0; i < 20; i++) {
+        if (sock && !sock.authState?.creds?.registered) break;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    }
+
+    if (!sock) {
+      throw new Error('WhatsApp socket is starting up. Please retry in 2 seconds.');
+    }
+
     const code = await sock.requestPairingCode(digits);
     const formattedCode = code ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
     console.log(`[WA] 🔢 Pairing code generated for ${digits}: ${formattedCode} (Raw: ${code})`);
-    res.json({
+    
+    return res.json({
       success: true,
       phone: digits,
       pairingCode: formattedCode,
@@ -910,15 +968,30 @@ app.all('/pair', async (req, res) => {
       instructions: 'Open WhatsApp -> Linked Devices -> Link a Device -> Link with phone number instead -> Enter 8-digit code',
     });
   } catch (err) {
-    console.error(`[WA] ❌ Pairing code generation failed for ${digits}:`, err.message);
-    if (err.message?.includes('registered') || err.message?.includes('closed') || err.message?.includes('401')) {
-      return res.status(400).json({
-        success: false,
-        error: `Could not generate code: ${err.message}. Please click "Reset Session" and retry.`,
-        needsReset: true,
-      });
+    console.warn(`[WA] First pairing code attempt failed (${err.message}). Retrying with fresh socket...`);
+    try {
+      await resetWhatsAppSession();
+      await new Promise((r) => setTimeout(r, 2500));
+      if (sock) {
+        const retryCode = await sock.requestPairingCode(digits);
+        const retryFormatted = retryCode ? `${retryCode.slice(0, 4)}-${retryCode.slice(4)}` : retryCode;
+        console.log(`[WA] 🔢 Pairing code generated on retry for ${digits}: ${retryFormatted}`);
+        return res.json({
+          success: true,
+          phone: digits,
+          pairingCode: retryFormatted,
+          rawCode: retryCode,
+          instructions: 'Open WhatsApp -> Linked Devices -> Link a Device -> Link with phone number instead -> Enter 8-digit code',
+        });
+      }
+    } catch (retryErr) {
+      console.error(`[WA] ❌ Retry pairing code failed:`, retryErr.message);
     }
-    res.status(500).json({ success: false, error: err.message });
+
+    return res.status(500).json({
+      success: false,
+      error: `Could not generate 8-digit code: ${err.message}. Please click "Reset Session" and try again.`,
+    });
   }
 });
 
@@ -948,7 +1021,7 @@ app.get('/qr', async (req, res) => {
         }
         .container {
           width: 100%;
-          max-width: 480px;
+          max-width: 490px;
           background: #ffffff;
           border-radius: 24px;
           box-shadow: 0 20px 40px -15px rgba(22, 101, 52, 0.12), 0 0 0 1px rgba(22, 101, 52, 0.08);
@@ -990,11 +1063,11 @@ app.get('/qr', async (req, res) => {
         }
         .tab-btn {
           flex: 1;
-          padding: 10px 12px;
+          padding: 11px 12px;
           border: none;
           background: transparent;
           font-family: inherit;
-          font-size: 12px;
+          font-size: 13px;
           font-weight: 800;
           color: #64748b;
           border-radius: 10px;
@@ -1017,7 +1090,7 @@ app.get('/qr', async (req, res) => {
         /* QR View */
         .qr-wrapper {
           text-align: center;
-          padding: 10px 0;
+          padding: 8px 0;
         }
         .qr-box {
           display: inline-block;
@@ -1029,14 +1102,14 @@ app.get('/qr', async (req, res) => {
           position: relative;
         }
         .qr-img {
-          width: 240px;
-          height: 240px;
+          width: 250px;
+          height: 250px;
           display: block;
           border-radius: 10px;
         }
         .qr-spinner {
-          width: 240px;
-          height: 240px;
+          width: 250px;
+          height: 250px;
           display: flex;
           flex-direction: column;
           align-items: center;
@@ -1049,8 +1122,8 @@ app.get('/qr', async (req, res) => {
           font-weight: 700;
         }
         .spin {
-          width: 32px;
-          height: 32px;
+          width: 34px;
+          height: 34px;
           border: 3px solid #cbd5e1;
           border-top-color: #16a34a;
           border-radius: 50%;
@@ -1059,7 +1132,7 @@ app.get('/qr', async (req, res) => {
         @keyframes spin { to { transform: rotate(360deg); } }
 
         .scan-steps {
-          margin-top: 18px;
+          margin-top: 16px;
           background: #f8fafc;
           border: 1px solid #e2e8f0;
           border-radius: 14px;
@@ -1074,7 +1147,7 @@ app.get('/qr', async (req, res) => {
           text-align: center;
         }
         .input-group {
-          margin-bottom: 14px;
+          margin-bottom: 12px;
           text-align: left;
         }
         .input-group label {
@@ -1103,6 +1176,28 @@ app.get('/qr', async (req, res) => {
           background: #ffffff;
           box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.15);
         }
+        .quick-chips {
+          display: flex;
+          gap: 6px;
+          margin-top: 6px;
+          margin-bottom: 12px;
+        }
+        .chip {
+          padding: 4px 10px;
+          background: #f1f5f9;
+          border: 1px solid #cbd5e1;
+          border-radius: 16px;
+          font-size: 11px;
+          font-weight: 700;
+          color: #334155;
+          cursor: pointer;
+          transition: all 0.15s;
+        }
+        .chip:hover {
+          background: #e2e8f0;
+          color: #0f172a;
+        }
+
         .btn-primary {
           width: 100%;
           padding: 14px;
@@ -1124,7 +1219,7 @@ app.get('/qr', async (req, res) => {
         .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
 
         .code-card {
-          margin-top: 18px;
+          margin-top: 16px;
           padding: 16px;
           background: #f0fdf4;
           border: 2px dashed #86efac;
@@ -1132,7 +1227,7 @@ app.get('/qr', async (req, res) => {
           text-align: center;
         }
         .code-display {
-          font-family: monospace;
+          font-family: 'Courier New', Courier, monospace;
           font-size: 32px;
           font-weight: 900;
           letter-spacing: 4px;
@@ -1140,7 +1235,7 @@ app.get('/qr', async (req, res) => {
           background: #ffffff;
           padding: 12px 16px;
           border-radius: 12px;
-          border: 1px solid #bbf7d0;
+          border: 1.5px solid #bbf7d0;
           margin: 10px 0;
           display: flex;
           align-items: center;
@@ -1152,11 +1247,14 @@ app.get('/qr', async (req, res) => {
           color: #ffffff;
           border: none;
           border-radius: 8px;
-          padding: 6px 10px;
-          font-size: 11px;
+          padding: 8px 12px;
+          font-size: 12px;
           font-weight: 800;
           cursor: pointer;
+          font-family: inherit;
+          letter-spacing: normal;
         }
+        .btn-copy:hover { background: #15803d; }
 
         /* Connected View */
         .connected-card {
@@ -1211,9 +1309,9 @@ app.get('/qr', async (req, res) => {
           background: transparent;
           border: 1px solid #cbd5e1;
           color: #64748b;
-          padding: 8px 14px;
+          padding: 9px 16px;
           border-radius: 10px;
-          font-size: 11px;
+          font-size: 12px;
           font-weight: 800;
           cursor: pointer;
           transition: all 0.2s;
@@ -1244,7 +1342,7 @@ app.get('/qr', async (req, res) => {
         <div class="header">
           <div class="brand-badge">🌿 Shiv Agro Agency Bot</div>
           <h1>WhatsApp Connection Hub</h1>
-          <p>Link your phone once to send instant bills & stock alerts 24/7</p>
+          <p>Link phone once to send instant bills & stock alerts 24/7</p>
         </div>
 
         <div class="body">
@@ -1274,7 +1372,7 @@ app.get('/qr', async (req, res) => {
                 <span>📷 Scan QR Code</span>
               </button>
               <button class="tab-btn" onclick="setTab('pair')">
-                <span>🔢 8-Digit Pairing Code</span>
+                <span>🔢 8-Digit Code</span>
               </button>
             </div>
 
@@ -1289,15 +1387,15 @@ app.get('/qr', async (req, res) => {
                   <img id="qr-image" class="qr-img" src="" alt="WhatsApp QR Code" style="display:none;" />
                 </div>
                 <div style="font-size:11px;color:#166534;font-weight:800;margin-top:10px;">
-                  <span class="pulse-dot"></span> Live auto-refreshing every 20s
+                  <span class="pulse-dot"></span> Live auto-refreshing
                 </div>
               </div>
 
               <div class="scan-steps">
-                <p>📋 Quick Steps to Scan:</p>
+                <p>📋 Quick Steps to Scan (QR સ્કેન કરવાની રીત):</p>
                 <ol>
                   <li>Open <strong>WhatsApp</strong> on your phone</li>
-                  <li>Tap <strong>Settings (or ⋮)</strong> → <strong>Linked Devices</strong></li>
+                  <li>Tap <strong>Settings (or ⋮)</strong> → <strong>Linked Devices</strong> (લિંક કરેલા ઉપકરણો)</li>
                   <li>Tap <strong>Link a Device</strong> & scan the QR above</li>
                 </ol>
               </div>
@@ -1307,8 +1405,12 @@ app.get('/qr', async (req, res) => {
             <div id="tab-pair" class="tab-pane" style="display:none;">
               <div class="pair-container">
                 <div class="input-group">
-                  <label>WhatsApp Phone Number</label>
+                  <label>WhatsApp Mobile Number</label>
                   <input type="text" id="phone-input" class="phone-input" value="99098 73595" placeholder="e.g. 9909873595" />
+                  <div class="quick-chips">
+                    <button type="button" class="chip" onclick="setPhone('9909873595')">Vijaybhai (9909873595)</button>
+                    <button type="button" class="chip" onclick="setPhone('9429539279')">Papa (9429539279)</button>
+                  </div>
                 </div>
 
                 <button class="btn-primary" id="btn-pair" onclick="getPairingCode()">
@@ -1316,15 +1418,16 @@ app.get('/qr', async (req, res) => {
                 </button>
 
                 <div id="code-result" class="code-card" style="display:none;">
-                  <p style="font-size:12px;font-weight:800;color:#166534;">Enter this code on your WhatsApp:</p>
+                  <p style="font-size:12px;font-weight:800;color:#166534;">Enter this 8-digit code on WhatsApp (કોડ WhatsApp માં દાખલ કરો):</p>
                   <div class="code-display">
                     <span id="code-text">----</span>
                     <button class="btn-copy" onclick="copyCode()">Copy</button>
                   </div>
-                  <div style="font-size:11px;color:#64748b;line-height:1.5;text-align:left;margin-top:8px;">
-                    1. Open <strong>WhatsApp</strong> → <strong>Linked Devices</strong><br>
-                    2. Tap <strong>Link a Device</strong><br>
-                    3. Tap <strong>"Link with phone number instead"</strong> at bottom<br>
+                  <div style="font-size:12px;color:#334155;line-height:1.6;text-align:left;margin-top:10px;background:#ffffff;padding:10px;border-radius:10px;border:1px solid #cbd5e1;">
+                    <strong>📱 Steps on Phone:</strong><br>
+                    1. Open <strong>WhatsApp</strong> → <strong>Linked Devices</strong> (લિંક કરેલ ડિવાઇસ)<br>
+                    2. Tap <strong>Link a Device</strong> (ડિવાઇસ લિંક કરો)<br>
+                    3. Tap <strong>"Link with phone number instead"</strong> (તેના બદલે ફોન નંબર સાથે લિંક કરો)<br>
                     4. Type the 8-digit code above!
                   </div>
                 </div>
@@ -1344,6 +1447,10 @@ app.get('/qr', async (req, res) => {
         let currentTab = 'qr';
         let pollTimer = null;
         let lastRawCode = '';
+
+        function setPhone(num) {
+          document.getElementById('phone-input').value = num;
+        }
 
         function setTab(tab) {
           currentTab = tab;
@@ -1392,7 +1499,7 @@ app.get('/qr', async (req, res) => {
           const digits = raw.replace(/[^0-9]/g, '');
           const btn = document.getElementById('btn-pair');
           btn.disabled = true;
-          btn.innerHTML = '<span>Generating code...</span>';
+          btn.innerHTML = '<span>Generating 8-digit code...</span>';
 
           try {
             const res = await fetch('/pair?phone=' + digits);
@@ -1415,7 +1522,7 @@ app.get('/qr', async (req, res) => {
 
         function copyCode() {
           const text = lastRawCode || document.getElementById('code-text').innerText.replace(/-/g, '');
-          navigator.clipboard.writeText(text).then(() => alert('Code copied to clipboard!'));
+          navigator.clipboard.writeText(text).then(() => alert('Code ' + text + ' copied to clipboard!'));
         }
 
         async function resetSession() {
@@ -1429,7 +1536,7 @@ app.get('/qr', async (req, res) => {
 
           try {
             await fetch('/reset-session');
-            setTimeout(pollStatus, 2000);
+            setTimeout(pollStatus, 1500);
           } catch (err) {
             alert('Reset error: ' + err.message);
           }
